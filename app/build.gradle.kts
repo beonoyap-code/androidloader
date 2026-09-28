@@ -97,8 +97,11 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
 
-    // Apple's provisioning/codesigning layer needs a full JCE with CMS/PKCS#12 support.
-    // The Android platform provider omits those, so we bundle BouncyCastle.
+    // Apple's provisioning/codesigning layer needs a full JCE with CMS/PKCS#12
+    // support. The Android platform provider omits those, so BouncyCastle is
+    // bundled. bcpkix supplies the X.509 builder APIs used to mint the pairing
+    // host certificate; bcprov and bcutil are its crypto and ASN.1 helpers.
+    implementation(libs.bcpkix)
     implementation(libs.bcpkix.jdk18on)
     implementation(libs.bcutil)
 
