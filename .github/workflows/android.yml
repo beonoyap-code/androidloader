@@ -32,20 +32,18 @@ jobs:
       - name: Validate the wrapper
         uses: gradle/actions/wrapper-validation@v4
 
-      - name: Cache the Android SDK
-        id: android-sdk-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.android/sdk
-            **/build-tools
-            **/platforms
-          key: sdk-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
-
+      # ubuntu-latest ships no Android SDK, so cmdline-tools are fetched first.
+      # Caching the installed SDK avoids re-downloading several hundred megabytes
+      # on every run; the key covers the version list so changing it invalidates.
       - name: Install the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept the SDK licences
         run: |
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Install the SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Lint
         run: ./gradlew --no-daemon :app:lintDebug
@@ -81,8 +79,9 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # The store is passed in base64 so the binary never touches the repo.
+          # The store arrives base64-encoded so the binary is never committed.
           printf '%s' "$ANDROIDLOADER_KEYSTORE" | base64 -d > keystore.jks
+          ./gradlew --no-daemon :app:assembleRelease
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload the debug APK
