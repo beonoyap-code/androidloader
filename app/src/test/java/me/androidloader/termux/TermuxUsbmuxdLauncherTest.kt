@@ -20,10 +20,11 @@ class TermuxUsbmuxdLauncherTest {
     @Test
     fun `includes the device path termux-usb requires`() {
         // termux-usb checks $# before anything else and exits with
-        // "missing -l or device path" when the argument is absent.
+        // "missing -l or device path" when the argument is absent, so the path has
+        // to be the final, quoted positional argument.
         val command = TermuxUsbmuxdLauncher.command(device = path)
-        assertTrue(command, command.endsWith("\"$path\""))
-        assertTrue(command, command.contains(" $path"))
+        assertTrue(command, command.endsWith(" \"$path\""))
+        assertTrue(command, command.contains(path))
     }
 
     @Test
