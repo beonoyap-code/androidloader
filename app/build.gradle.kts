@@ -74,8 +74,15 @@ android {
 
     packaging {
         resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-            excludes += "/META-INF/versions/9/previous-compilation-data.bin"
+            // Each BouncyCastle artifact ships an OSGi manifest under its own
+            // multi-release directory, and those collide during
+            // mergeDebugJavaResource. They are packaging metadata with no runtime
+            // effect. Only the manifests are excluded: the classes alongside them
+            // under META-INF/versions are real and must be kept.
+            excludes += "META-INF/versions/*/OSGI-INF/MANIFEST.MF"
+            excludes += "META-INF/OSGI-INF/MANIFEST.MF"
+            excludes += "META-INF/DEPENDENCIES"
+            excludes += "META-INF/{AL2.0,LGPL2.1}"
         }
     }
 }
