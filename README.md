@@ -1,0 +1,116 @@
+# androidloader
+
+Sideload iOS apps from an Android phone, the way [iloader](https://github.com/nab138/iloader)
+does from a PC. Plug the iPhone into the phone's USB-OTG port, pair, install — no
+computer in the loop.
+
+The app speaks Apple's `usbmuxd` protocol directly over the socket that
+`termux-usbmuxd` exposes, then layers the usual lockdownd / AFC /
+`installation_proxy` services on top. Everything above usbmuxd is plain protocol
+work and is implemented here in Kotlin.
+
+## Requirements
+
+- An Android phone with USB-OTG support, Android 8.0+
+- [Termux](https://f-droid.org/packages/com.termux/) and
+  [Termux:API](https://f-droid.org/packages/com.termux.api/), both from F-Droid
+- An iPhone you own, on iOS 16+, with Developer Mode enabled
+
+## Setup
+
+In Termux:
+
+```sh
+pkg install usbmuxd libimobiledevice termux-api
+```
+
+## How the USB bridge works
+
+`usbmuxd` cannot open the `usbfs` device nodes from inside an Android app's
+sandbox — those nodes belong to a system group an app UID is not in. Termux:API's
+`termux-usb` can, because it claims the device through Android's USB API; with
+`-E` it executes a child process that inherits the claimed file descriptor. That
+is the whole trick, and it needs no root:
+
+```sh
+termux-usb -r -E -e "usbmuxd --socket 127.0.0.1:27015 --pidfile NONE -f" /dev/bus/usb/001/002
+```
+
+**The socket address matters.** The daemon's default is a Unix socket inside
+Termux's private data directory, which an APK cannot open — different UID, `0700`
+permissions. Loopback TCP is shared between apps, so TCP is the only transport
+reachable from the app. `TermuxUsbmuxdLauncher` builds exactly the command above.
+
+Find the device path with `termux-usb -l`. If no device appears, check that the
+cable carries data and that the phone accepts OTG; some vendor kernels still
+refuse, and no wrapper can force access the system will not grant.
+
+## Using the app
+
+1. Tap **Start usbmuxd in Termux**, then plug the iPhone into the OTG port.
+2. Tap **Look for iPhone** to confirm usbmuxd sees it.
+3. Unlock the iPhone and tap **Pair with this iPhone**, then accept the trust
+   prompt on the phone.
+
+Pairing is cached per device. Later launches reuse the stored record and only
+need a session.
+
+## What is implemented
+
+| Layer | State |
+| --- | --- |
+| usbmuxd wire protocol, framing, device list | complete, unit tested |
+| Service framing (length-prefixed messages) | complete, unit tested |
+| Property lists: XML encode/decode, binary decode | complete, unit tested |
+| lockdownd session, pairing, TLS with the pairing root | complete |
+| Pairing record storage, host identity generation | complete |
+| Termux:API launcher, package visibility | complete |
+| AFC file transfer | written, untested against hardware |
+| `installation_proxy` install and uninstall | written, untested against hardware |
+| IPA inspection | written, untested against real bundles |
+| Apple ID sign-in (SRP-6a, GrandSlam) | crypto complete and unit tested; the HTTP flow and the private developer endpoints are **not** done |
+| Codesigning, provisioning profiles | not started |
+
+Read the table as the honest state of the project. Everything above the AFC row is
+exercised by unit tests. Nothing below it has been run against an iPhone, and the
+GrandSlam work stops at the cryptography.
+
+## Free developer account limits
+
+A free Apple ID provisions for **7 days** and allows **3 apps per 7 days**. The
+third app of a rolling week will fail with `-402620395`; the message the app shows
+names this. Development certificates and app IDs are also capped, and expired
+profiles need removing from the device before a fresh one can be used.
+
+## Building
+
+```sh
+./gradlew assembleDebug
+```
+
+Requires JDK 17 and an Android SDK with platform 35. Outputs
+`app/build/outputs/apk/debug/app-debug.apk`.
+
+CI builds both variants on every push and pull request. A signed release needs
+four repository secrets — `KEYSTORE_BASE64` (the keystore, base64-encoded),
+`KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. Without them the release APK is
+built unsigned and no release is published, so forks run the full workflow.
+
+## Design notes
+
+Two details in this protocol are easy to get wrong and are worth knowing before
+changing the code:
+
+- **`PortNumber` is byte-swapped** before it is sent. The field is read back as a
+  little-endian 16-bit value, so lockdownd's 62078 (`0xF27E`) goes out as
+  `0x7EF2`. The reference client does this with `port.to_be()`, which looks like
+  a no-op until you know the field is little-endian on the far side.
+- **SRP-6a here follows the `srp` crate, not RFC 5054.** The identity hash is
+  `H(username | ":" | password)`, and `M1`/`M2` are `H(A|B|K)` and `H(A|M1|K)`
+  with no `H(N) XOR H(g)` term. `k` hashes `N | PAD(g)`, so `g` is zero-padded to
+  the modulus width. Any of these differing from the RFC still produces a
+  self-consistent client that fails exactly like a wrong password.
+
+## License
+
+MIT. Not affiliated with Apple, iloader, or Termux.

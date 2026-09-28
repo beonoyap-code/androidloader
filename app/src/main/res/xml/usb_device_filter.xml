@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Apple vendor ID. A filter is not required to talk to usbmuxd on TCP, but it lets
+  Android offer the app when an iPhone is attached to the OTG port.
+-->
+<resources>
+    <usb-device vendor-id="1452" product-id="4778" />
+    <usb-device vendor-id="1452" product-id="4779" />
+    <usb-device vendor-id="1452" product-id="4736" />
+</resources>
