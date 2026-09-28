@@ -1,156 +1,191 @@
 package me.androidloader.termux
 
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
-import android.net.Uri
+import android.content.pm.PackageManager
 import android.os.Build
-import me.androidloader.usbmux.UsbmuxClient
 import me.androidloader.usbmux.UsbmuxEndpoint
 
 /**
- * How to start usbmuxd on an unrooted phone.
+ * Starts usbmuxd from Termux.
  *
- * The daemon itself cannot open the `usbfs` device nodes from inside Termux, because
- * Android's USB nodes are not accessible to an app UID. The way around it is
- * Termux:API's `termux-usb`, which claims the device through Android's USB API
- * and, with `-E`, executes a child process holding that file descriptor:
+ * The daemon cannot open the `usbfs` device nodes from inside an app's sandbox:
+ * those nodes belong to a system group an app UID is not in. Termux:API's
+ * `termux-usb` can, because it claims the device through Android's USB API; with
+ * `-E` it executes a child process that inherits the claimed file descriptor. That
+ * is what makes this work without root.
  *
- * ```
- * termux-usb -r -E -e "usbmuxd --socket 127.0.0.1:27015 --pidfile NONE -f" /dev/bus/usb/001/002
- * ```
+ * Three things about the intent are easy to get wrong, and each fails with a
+ * message that points somewhere else:
  *
- * TCP is chosen over the daemon's default Unix socket because that socket lives
- * in Termux's private data directory, which this app cannot open. Loopback is
- * shared between apps, so TCP is the only transport available to an APK.
+ *  - The service lives in the **Termux app** (`com.termux`), not Termux:API.
+ *    Termux:API removed its own `RunCommandService`; the one that exists is
+ *    `com.termux.app.RunCommandService`.
+ *  - It is a **Service**, so it must be started with [Context.startService]. Using
+ *    `startActivity` raises `ActivityNotFoundException`, which reads as though
+ *    Termux were not installed.
+ *  - Termux refuses to run commands from other apps unless `allow-external-apps`
+ *    is set in `~/.termux/termux.properties`. It fails this with a notification
+ *    and no return value, so the caller sees success and nothing happens.
+ *
+ * None of this is on the critical path: the app works with a usbmuxd the user has
+ * already started by hand. This is a convenience on top of that.
  */
 object TermuxUsbmuxdLauncher {
 
-    /** The Termux:API package that provides `termux-usb`. */
-    const val TERMUX_API_PACKAGE = "com.termux.api"
-
-    /** The Termux package, used to verify it is installed. */
+    /** The Termux package that hosts the run-command service. */
     const val TERMUX_PACKAGE = "com.termux"
+
+    /** The service component, in Termux itself rather than Termux:API. */
+    const val SERVICE_CLASS = "com.termux.app.RunCommandService"
+
+    /** The permission that service checks. */
+    const val PERMISSION = "$TERMUX_PACKAGE.permission.RUN_COMMAND"
 
     /**
      * The command to run inside Termux.
      *
      * @param device the USB path from `termux-usb -l`, or null to let
      *   `termux-usb` pick the only attached device.
-     * @param foreground kept in the foreground; the daemon must outlive the call,
-     *   so it is launched with `-f` and detached by Termux itself.
      */
     fun command(
         device: String? = null,
         endpoint: UsbmuxEndpoint = UsbmuxEndpoint.DEFAULT,
     ): String {
-        val args = buildList {
-            add("usbmuxd")
-            add("--socket")
-            add("${endpoint.host}:${endpoint.port}")
+        val args = listOf(
+            "usbmuxd",
+            "--socket", "${endpoint.host}:${endpoint.port}",
             // No pidfile: Termux runs the process directly and does not need one,
-            // and writing outside its own tree is not permitted.
-            add("--pidfile")
-            add("NONE")
-            add("-f")
-        }.joinToString(" ")
+            // and it cannot write outside its own tree.
+            "--pidfile", "NONE",
+            // Foreground, because the daemon has to outlive the request.
+            "-f",
+        ).joinToString(" ")
         val target = device?.let { " \"$it\"" } ?: ""
         return "termux-usb -r -E -e \"$args\"$target"
     }
 
+    /** True when the Termux app is installed and visible to this process. */
+    fun isTermuxInstalled(context: Context): Boolean =
+        context.packageManager.queryIntentActivities(
+            Intent().setClassName(TERMUX_PACKAGE, SERVICE_CLASS),
+            0,
+        ).isNotEmpty()
+
     /**
-     * The Termux:API intent that runs [command] in a Termux session.
+     * Whether this app holds the permission the service checks.
      *
-     * Returns null when Termux:API is not installed, which is the common case on a
-     * fresh phone and should be presented as setup guidance rather than an error.
+     * Android 13+ can revoke a permission the app has not used recently, so this
+     * is checked rather than assumed.
      */
-    fun runCommandIntent(command: String, session: String = "androidloader"): Intent? = try {
-        Intent().apply {
-            setClassName(TERMUX_API_PACKAGE, "com.termux.api.RunCommandService")
+    fun hasPermission(context: Context): Boolean =
+        context.checkSelfPermission(PERMISSION) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * The intent that runs [command] in a Termux session.
+     *
+     * Returns null when Termux is absent, which is a setup state rather than an
+     * error: the user can still start usbmuxd by hand.
+     */
+    fun runCommandIntent(command: String, session: String = "androidloader"): Intent? {
+        val intent = Intent().apply {
+            component = ComponentName(TERMUX_PACKAGE, SERVICE_CLASS)
             action = "com.termux.RUN_COMMAND"
-            // Required because this is launched from an application context
-            // rather than an activity, and it is a hard failure without it.
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/$TERMUX_PACKAGE/files/usr/bin/bash")
-            // An ArrayList is required here; Termux:API reads this extra as an
-            // ArrayList<String> and rejects a plain list.
+            putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_PREFIX + "/bin/bash")
+            // Termux reads this as a String[]; a plain list is rejected.
             putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayListOf("-lc", command))
-            putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/$TERMUX_PACKAGE/files/usr")
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_PREFIX)
+            // The app shell runner, so the daemon is not tied to a terminal session.
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
             putExtra("com.termux.RUN_COMMAND_SESSION", session)
-            putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", false)
         }
-    } catch (e: Exception) {
-        null
+        return intent
     }
 
-    /**
-     * The outcome of asking Termux:API to start the daemon.
-     *
-     * A sealed result rather than a boolean because each failure has a different
-     * remedy, and the user cannot see the Termux side of any of them.
-     */
+    private const val TERMUX_PREFIX = "/data/data/$TERMUX_PACKAGE/files/usr"
+
+    /** The outcome of asking Termux to run the daemon. */
     sealed interface LaunchResult {
-        /** Termux:API accepted the request. The daemon is not up yet. */
+        /** Termux accepted the request. The daemon is not up yet. */
         data object Started : LaunchResult
 
-        /** Termux:API is not installed, or its service could not be resolved. */
+        /** Termux is not installed, or is not visible to this app. */
         data object NotInstalled : LaunchResult
 
-        /** Termux:API refused because this app lacks the RUN_COMMAND permission. */
+        /** This app does not hold the RUN_COMMAND permission. */
         data object PermissionDenied : LaunchResult
 
-        /** Anything else, with the reason to show. */
+        /** Termux refused to start, with the reason to show. */
         data class Failed(val reason: String) : LaunchResult
     }
 
     /**
-     * Asks Termux:API to run the daemon.
+     * Asks Termux to start usbmuxd.
      *
-     * [context] may be an application context, which is why the intent carries
-     * [android.content.Intent.FLAG_ACTIVITY_NEW_TASK]: `startActivity` from a
-     * non-activity context throws otherwise, and that failure is an
-     * `AndroidRuntimeException` rather than a `SecurityException`, so a narrower
-     * catch would let it crash the app.
-     *
-     * The daemon is not reachable when this returns; callers should poll
-     * [UsbmuxClient.connect] with a delay.
+     * This is best effort and never fatal: the app talks to a usbmuxd over
+     * loopback regardless of who started it, so a failure here is reported and
+     * the user can run [command] by hand.
      */
     fun launch(
-        context: android.content.Context,
+        context: Context,
         device: String? = null,
         endpoint: UsbmuxEndpoint = UsbmuxEndpoint.DEFAULT,
     ): LaunchResult {
+        if (!isTermuxInstalled(context)) return LaunchResult.NotInstalled
+        if (!hasPermission(context)) return LaunchResult.PermissionDenied
+
         val intent = runCommandIntent(command(device, endpoint))
             ?: return LaunchResult.NotInstalled
+
         return try {
-            context.startActivity(intent)
+            // A Service, so startService, not startActivity.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
             LaunchResult.Started
         } catch (e: SecurityException) {
             LaunchResult.PermissionDenied
-        } catch (e: android.content.ActivityNotFoundException) {
-            LaunchResult.NotInstalled
+        } catch (e: IllegalStateException) {
+            // Android 8+ refuses background service starts; the user tapping the
+            // button normally keeps us in the foreground, but not always.
+            LaunchResult.Failed("Termux could not be started from the background: ${e.message}")
         } catch (e: RuntimeException) {
-            // Includes the missing-NEW_TASK failure above, which must not take the
-            // app down with it.
             LaunchResult.Failed(e.message ?: e.javaClass.simpleName)
         }
     }
 
     /**
-     * Guidance for a failed launch, phrased for someone who cannot see Termux.
+     * Guidance for a failed launch.
+     *
+     * The `allow-external-apps` note is not optional: without it Termux accepts
+     * the request and silently does nothing, which is the hardest failure here to
+     * diagnose from the outside.
      */
     fun explain(result: LaunchResult): String = when (result) {
         LaunchResult.Started -> ""
         LaunchResult.NotInstalled ->
-            "Termux:API is not installed. Install Termux and Termux:API from F-Droid, " +
-                "then run in Termux:\n\npkg install usbmuxd libimobiledevice termux-api"
+            "Termux is not visible to this app. Install Termux from F-Droid, or just " +
+                "start usbmuxd yourself and tap Look for iPhone."
         LaunchResult.PermissionDenied ->
-            "Termux:API refused the request. Open Settings, then Apps, Termux:API, " +
-                "Permissions, and allow \"Run commands\". The permission is " +
-                "${requiredPermission()}."
+            "This app is missing the Termux permission. Reinstall the app, then check " +
+                "Settings, Apps, this app, Permissions for \"$PERMISSION\". " +
+                "Android sometimes revokes permissions an app has not used recently."
         is LaunchResult.Failed ->
-            "Termux:API could not be started: ${result.reason}"
+            "Termux could not start: ${result.reason}"
     }
 
-    /** The `RUN_COMMAND` permission Termux:API checks. */
-    fun requiredPermission(): String = "$TERMUX_API_PACKAGE.permission.RUN_COMMAND"
+    /**
+     * The one-time Termux setting this feature needs, phrased as an instruction.
+     *
+     * Termux checks this before running anything from another app and reports the
+     * refusal only in a notification.
+     */
+    fun allowExternalAppsInstructions(): String =
+        "Termux also needs to be told it may run commands from other apps. In Termux:\n\n" +
+            "mkdir -p ~/.termux\n" +
+            "echo 'allow-external-apps = true' >> ~/.termux/termux.properties\n" +
+            "then restart Termux from the app drawer"
 }

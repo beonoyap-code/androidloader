@@ -24,6 +24,7 @@ data class SideloadUiState(
     val devices: List<UsbmuxProtocol.Device> = emptyList(),
     val progressMessage: String = "",
     val error: String? = null,
+    val hint: String? = null,
     val log: List<String> = emptyList(),
 ) {
     /** One line summarising where the flow has got to. */
@@ -31,19 +32,28 @@ data class SideloadUiState(
         get() = when {
             busy -> "Working"
             error != null -> "Needs attention"
-            usbmuxdRunning && devices.isEmpty() -> "No iPhone found"
-            usbmuxdRunning -> "${devices.size} iPhone connected"
+            usbmuxdRunning && devices.isEmpty() -> "Connected, no iPhone found"
+            usbmuxdRunning -> "iPhone connected"
             else -> "Not connected to usbmuxd"
         }
 
+    /**
+     * What to tell the user next.
+     *
+     * Deliberately leads with the manual route. usbmuxd may be started by
+     * Termux, by this app, or by hand, and the app cannot tell which; telling
+     * someone with a working daemon that they need to start one is worse than
+     * saying nothing.
+     */
     val detail: String
         get() = when {
             busy -> progressMessage
             !usbmuxdRunning ->
-                "Start usbmuxd from Termux, then plug the iPhone into the OTG port."
+                "Run usbmuxd in Termux, then tap Look for iPhone:\n\n" +
+                    TermuxUsbmuxdLauncher.command()
             devices.isEmpty() ->
-                "usbmuxd is running but no device has appeared. Check the cable and that " +
-                    "the phone accepts USB-OTG."
+                "usbmuxd is running but sees no device. Check the cable carries data, " +
+                    "and that the iPhone is unlocked."
             else -> "Unlock the iPhone and accept the trust prompt when it appears."
         }
 }
@@ -51,10 +61,10 @@ data class SideloadUiState(
 /**
  * Drives the connection flow.
  *
- * The ordering here is the whole story of the app: nothing works until usbmuxd is
- * running, and nothing privileged works until the device is paired. Each step
- * therefore reports its own failure with the remedy, because the user cannot see
- * the Termux side of it.
+ * The app talks to usbmuxd over loopback regardless of who started it, so
+ * [lookForDevices] is the real entry point and starting the daemon is a
+ * convenience layered on top. That ordering means a user whose usbmuxd is
+ * already running never depends on the Termux permission dance working.
  */
 class SideloadViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -63,72 +73,104 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
 
     private val usbmux = UsbmuxClient()
 
+    /**
+     * Probes usbmuxd and lists devices.
+     *
+     * This works against a daemon started by anyone: the app, Termux, or a
+     * command the user ran themselves.
+     */
+    fun lookForDevices() {
+        viewModelScope.launch {
+            _state.update {
+                it.copy(busy = true, error = null, progressMessage = "Looking for an iPhone")
+            }
+            try {
+                usbmux.connect()
+                val devices = usbmux.listDevices()
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        usbmuxdRunning = true,
+                        devices = devices,
+                        progressMessage = "",
+                    )
+                }
+                if (devices.isEmpty()) {
+                    append("usbmuxd is up, but reported no devices")
+                    _state.update {
+                        it.copy(
+                            hint = "Plug the iPhone into the OTG port, unlock it, " +
+                                "then tap Look for iPhone again.",
+                        )
+                    }
+                } else {
+                    devices.forEach { append("found ${it.udid}") }
+                }
+            } catch (e: Exception) {
+                fail(describe(e))
+            }
+        }
+    }
+
+    /**
+     * Asks Termux to start usbmuxd, then waits for it.
+     *
+     * Best effort: on any failure the app still works, because the user can start
+     * the daemon themselves and tap Look for iPhone.
+     */
     fun startUsbmuxd() {
         viewModelScope.launch {
+            _state.update { it.copy(error = null, hint = null) }
             when (val result = TermuxUsbmuxdLauncher.launch(getApplication())) {
                 is TermuxUsbmuxdLauncher.LaunchResult.Started -> {
-                    append("Asked Termux to start usbmuxd")
-                    // The daemon needs a moment to bind its socket; poll briefly
-                    // rather than reporting failure on the first refused
-                    // connection.
-                    pollForUsbmuxd()
+                    append("asked Termux to start usbmuxd")
+                    _state.update {
+                        it.copy(
+                            hint = "If nothing happens, Termux is not allowed to run " +
+                                "commands from other apps yet:\n\n" +
+                                TermuxUsbmuxdLauncher.allowExternalAppsInstructions(),
+                        )
+                    }
+                    waitForUsbmuxd()
                 }
                 else -> {
                     val explanation = TermuxUsbmuxdLauncher.explain(result)
-                    append("launch failed: $explanation")
-                    fail(
-                        explanation + "\n\nIf Termux is set up, run this by hand instead:\n" +
-                            TermuxUsbmuxdLauncher.command(),
-                    )
+                    append("could not ask Termux to start usbmuxd: $explanation")
+                    _state.update {
+                        it.copy(
+                            hint = "$explanation\n\nYou can start it yourself in Termux:\n\n" +
+                                TermuxUsbmuxdLauncher.command() +
+                                "\n\nthen tap Look for iPhone.",
+                        )
+                    }
                 }
             }
         }
     }
 
-    private suspend fun pollForUsbmuxd() {
-        repeat(15) {
-            delay(400)
-            if (probe()) {
-                _state.update { it.copy(usbmuxdRunning = true, error = null) }
+    /**
+     * Polls for the daemon after a launch request.
+     *
+     * Termux:API returns as soon as the request is accepted, and the daemon takes a
+     * moment to bind its socket, so a single immediate probe would report a
+     * failure that is not one.
+     */
+    private suspend fun waitForUsbmuxd() {
+        repeat(12) {
+            kotlinx.coroutines.delay(500)
+            if (runCatching { usbmux.connect() }.isSuccess) {
                 append("usbmuxd is up")
-                refreshDevices()
+                lookForDevices()
                 return
             }
         }
-        fail(
-            "usbmuxd did not start. Check that Termux:API is installed and that " +
-                "'pkg install usbmuxd libimobiledevice' succeeded.",
-        )
-    }
-
-    private suspend fun probe(): Boolean = try {
-        usbmux.connect()
-        true
-    } catch (e: Exception) {
-        false
-    }
-
-    fun refresh() {
-        viewModelScope.launch { refreshDevices() }
-    }
-
-    private suspend fun refreshDevices() {
-        _state.update { it.copy(busy = true, error = null, progressMessage = "Looking for iPhones") }
-        try {
-            usbmux.connect()
-            val devices = usbmux.listDevices()
-            _state.update {
-                it.copy(
-                    busy = false,
-                    usbmuxdRunning = true,
-                    devices = devices,
-                    progressMessage = "",
-                )
-            }
-            if (devices.isEmpty()) append("usbmuxd reported no devices")
-            else devices.forEach { append("found ${it.udid}") }
-        } catch (e: Exception) {
-            fail(describe(e))
+        append("usbmuxd did not come up within about six seconds")
+        _state.update {
+            it.copy(
+                hint = "usbmuxd did not start. Run this in Termux to see why:\n\n" +
+                    TermuxUsbmuxdLauncher.command(device = null, endpoint = me.androidloader.usbmux.UsbmuxEndpoint.DEFAULT)
+                        .replace(" -f", " -f -v"),
+            )
         }
     }
 
@@ -136,8 +178,8 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null, progressMessage = "Pairing") }
             try {
-                // Pairing records hold DER certificates and keys, so reading and
-                // writing them is file I/O and must not run on the main thread.
+                // Records hold DER certificates and keys, so this is file I/O and
+                // must not run on the main thread.
                 val stored = withContext(Dispatchers.IO) {
                     PairingStore.load(getApplication(), udid)
                 }
@@ -150,39 +192,51 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                     ?: error("the iPhone is no longer connected")
                 val socket = usbmux.connectTo(device, UsbmuxClient.PORT_LOCKDOWN)
                 val lockdown = LockdownClient.onChannel(device, UsbmuxSocketChannel(socket))
-                val result = lockdown.openSession(stored)
-                withContext(Dispatchers.IO) {
-                    PairingStore.save(getApplication(), udid, result)
+                try {
+                    val result = lockdown.openSession(stored)
+                    withContext(Dispatchers.IO) {
+                        PairingStore.save(getApplication(), udid, result)
+                    }
+                    append("paired and started a session")
+                    _state.update {
+                        it.copy(
+                            busy = false,
+                            progressMessage = "",
+                            hint = "Paired with $udid.",
+                        )
+                    }
+                } finally {
+                    lockdown.close()
                 }
-                append("paired and started a session")
-                _state.update { it.copy(busy = false, progressMessage = "") }
-                lockdown.close()
             } catch (e: Exception) {
                 fail(describe(e))
             }
         }
     }
 
+    fun dismissMessages() {
+        _state.update { it.copy(error = null, hint = null) }
+    }
+
     private fun describe(e: Exception): String = when (e) {
-        is me.androidloader.usbmux.UsbmuxUnavailableException -> e.message
-            ?: "usbmuxd is not reachable"
-        is me.androidloader.lockdown.LockdownException -> e.message
-            ?: "lockdownd refused the request"
+        is me.androidloader.usbmux.UsbmuxUnavailableException ->
+            e.message ?: "usbmuxd is not reachable"
+        is me.androidloader.lockdown.LockdownException ->
+            e.message ?: "lockdownd refused the request"
         is me.androidloader.afc.AfcException -> e.message ?: "the file transfer failed"
         is me.androidloader.install.InstallException -> e.message ?: "the install failed"
+        is me.androidloader.usbmux.UsbmuxProtocolException -> e.message ?: "usbmuxd spoke unexpectedly"
         else -> e.message ?: e.toString()
     }
 
     private fun fail(message: String) {
         append("error: $message")
-        _state.update { it.copy(busy = false, error = message, progressMessage = "") }
+        _state.update { it.copy(busy = false, error = message, progressMessage = "", hint = null) }
     }
 
     private fun append(line: String) {
-        _state.update { it.copy(log = (it.log + line).takeLast(50)) }
+        _state.update { it.copy(log = (it.log + line).takeLast(60)) }
     }
-
-    private suspend fun delay(ms: Long) = kotlinx.coroutines.delay(ms)
 
     override fun onCleared() {
         usbmux.close()

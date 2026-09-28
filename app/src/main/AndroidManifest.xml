@@ -4,11 +4,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
-      Termux:API checks this before it will execute a command. It is a
-      normal (install-time) permission held by Termux:API itself, so declaring it
-      here is what lets the app start usbmuxd without root.
+      Termux checks this before it will run a command for another app. It belongs to
+      the Termux package, not Termux:API: Termux:API removed its own run-command
+      service, and com.termux.app.RunCommandService is the one that exists.
     -->
-    <uses-permission android:name="com.termux.api.permission.RUN_COMMAND" />
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
 
     <!--
       Android 11+ package visibility: without these the app cannot see Termux or

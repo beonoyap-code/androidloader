@@ -24,6 +24,22 @@ In Termux:
 pkg install usbmuxd libimobiledevice termux-api
 ```
 
+If you want the app to start the daemon for you, also allow external commands.
+Termux checks this before running anything another app asks for and reports the
+refusal only in a notification, so skipping it looks like the app silently doing
+nothing:
+
+```sh
+mkdir -p ~/.termux
+echo 'allow-external-apps = true' >> ~/.termux/termux.properties
+```
+
+Then force-close Termux from the app drawer so it re-reads the setting.
+
+**This step is optional.** The app talks to a usbmuxd over loopback regardless of
+who started it, so if you would rather run the command by hand, the *Start
+usbmuxd in Termux* button is unnecessary and *Look for iPhone* is enough.
+
 ## How the USB bridge works
 
 `usbmuxd` cannot open the `usbfs` device nodes from inside an Android app's
@@ -39,7 +55,7 @@ termux-usb -r -E -e "usbmuxd --socket 127.0.0.1:27015 --pidfile NONE -f" /dev/bu
 **The socket address matters.** The daemon's default is a Unix socket inside
 Termux's private data directory, which an APK cannot open — different UID, `0700`
 permissions. Loopback TCP is shared between apps, so TCP is the only transport
-reachable from the app. `TermuxUsbmuxdLauncher` builds exactly the command above.
+reachable from the app.
 
 Find the device path with `termux-usb -l`. If no device appears, check that the
 cable carries data and that the phone accepts OTG; some vendor kernels still
@@ -47,13 +63,24 @@ refuse, and no wrapper can force access the system will not grant.
 
 ## Using the app
 
-1. Tap **Start usbmuxd in Termux**, then plug the iPhone into the OTG port.
-2. Tap **Look for iPhone** to confirm usbmuxd sees it.
-3. Unlock the iPhone and tap **Pair with this iPhone**, then accept the trust
-   prompt on the phone.
+1. Start usbmuxd — either tap **Start usbmuxd in Termux**, or run the command
+   above in Termux yourself.
+2. Plug the iPhone into the OTG port and unlock it.
+3. Tap **Look for iPhone**.
+4. Tap **Pair with this iPhone** and accept the trust prompt on the phone.
 
-Pairing is cached per device. Later launches reuse the stored record and only
-need a session.
+Pairing is cached per device, so later launches only need a session.
+
+## Two traps in the Termux intent
+
+Both fail with a message that points somewhere else, which is why they are worth
+writing down:
+
+- The service is `com.termux.app.RunCommandService`, in the **Termux app**.
+  Termux:API removed its own copy, so aiming at the old name raises
+  `ActivityNotFoundException` — indistinguishable from "Termux is not installed".
+- It is a **Service**, so it must be started with `startService`. `startActivity`
+  produces the same misleading error.
 
 ## What is implemented
 
