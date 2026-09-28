@@ -43,6 +43,12 @@ object TermuxUsbmuxdLauncher {
     /** The permission that service checks. */
     const val PERMISSION = "$TERMUX_PACKAGE.permission.RUN_COMMAND"
 
+    /** The action that service accepts. */
+    const val ACTION = "$TERMUX_PACKAGE.RUN_COMMAND"
+
+    /** Extra carrying the argv for the command, as a String[]. */
+    const val EXTRA_ARGUMENTS = "$TERMUX_PACKAGE.RUN_COMMAND_ARGUMENTS"
+
     /**
      * The command to run inside Termux.
      *
@@ -91,10 +97,10 @@ object TermuxUsbmuxdLauncher {
     fun runCommandIntent(command: String, session: String = "androidloader"): Intent? {
         val intent = Intent().apply {
             component = ComponentName(TERMUX_PACKAGE, SERVICE_CLASS)
-            action = "com.termux.RUN_COMMAND"
+            action = ACTION
             putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_PREFIX + "/bin/bash")
             // Termux reads this as a String[]; a plain list is rejected.
-            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayListOf("-lc", command))
+            putExtra(EXTRA_ARGUMENTS, arrayListOf("-lc", command))
             putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_PREFIX)
             // The app shell runner, so the daemon is not tied to a terminal session.
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)

@@ -68,6 +68,8 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            // Lets tests that touch framework stubs call them instead of throwing.
+            // Tests needing real Intent behaviour use Robolectric explicitly.
             isReturnDefaultValues = true
         }
     }

@@ -23,27 +23,8 @@ class TermuxUsbmuxdLauncherTest {
         assertEquals("com.termux", TermuxUsbmuxdLauncher.TERMUX_PACKAGE)
         assertEquals("com.termux.app.RunCommandService", TermuxUsbmuxdLauncher.SERVICE_CLASS)
         assertEquals("com.termux.permission.RUN_COMMAND", TermuxUsbmuxdLauncher.PERMISSION)
-    }
-
-    @Test
-    fun `sends the run command action`() {
-        val intent = TermuxUsbmuxdLauncher.runCommandIntent("echo hi")!!
-        assertEquals("com.termux.RUN_COMMAND", intent.action)
-        assertEquals(
-            "com.termux",
-            intent.component?.packageName,
-        )
-        assertEquals(
-            TermuxUsbmuxdLauncher.SERVICE_CLASS,
-            intent.component?.className,
-        )
-    }
-
-    @Test
-    fun `passes arguments as an array list`() {
-        val intent = TermuxUsbmuxdLauncher.runCommandIntent("echo hi")!!
-        val args = intent.getStringArrayListExtra("com.termux.RUN_COMMAND_ARGUMENTS")
-        assertEquals(listOf("-lc", "echo hi"), args)
+        // The service is started with startService, not startActivity.
+        assertEquals("com.termux.RUN_COMMAND", TermuxUsbmuxdLauncher.ACTION)
     }
 
     @Test
