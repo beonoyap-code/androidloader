@@ -32,18 +32,39 @@ jobs:
       - name: Validate the wrapper
         uses: gradle/actions/wrapper-validation@v4
 
-      # ubuntu-latest ships no Android SDK, so cmdline-tools are fetched first.
-      # Caching the installed SDK avoids re-downloading several hundred megabytes
-      # on every run; the key covers the version list so changing it invalidates.
-      - name: Install the Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest ships no Android SDK. android-actions/setup-android is not
+      # used because it still tries to install the legacy `tools` package, which
+      # Google has removed from the repository, and fails on `Failed to find
+      # package 'tools'`. Fetching cmdline-tools directly avoids that dependency
+      # and pins the version.
+      - name: Install the Android command line tools
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest" /tmp/cmdline-tools
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
+          # The zip unpacks as cmdline-tools/, but sdkmanager only works from a
+          # directory named `latest`.
+          mv /tmp/cmdline-tools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
       - name: Accept the SDK licences
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager --licenses --sdk_root="$ANDROID_HOME" > /dev/null 2>&1 || true
 
       - name: Install the SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          sdkmanager --sdk_root="$ANDROID_HOME" \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Lint
         run: ./gradlew --no-daemon :app:lintDebug
