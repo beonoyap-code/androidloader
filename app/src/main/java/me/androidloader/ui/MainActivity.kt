@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -21,14 +22,20 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import me.androidloader.termux.TermuxUsbmuxdLauncher
 import me.androidloader.usbmux.UsbmuxProtocol
@@ -67,6 +74,18 @@ fun SideloadScreen(
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
 
+    // The USB bus is polled on entry and whenever the screen resumes, because the
+    // cable state is not something the app can be told about; it has to be asked.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        viewModel.refreshUsb()
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshUsb()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -99,6 +118,28 @@ fun SideloadScreen(
             )
         }
 
+        // What the USB host API sees, kept separate from what usbmuxd sees: those
+        // are different questions and confusing them made the earlier builds
+        // unable to say which half was broken.
+        state.usbNote?.let { note ->
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = note,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = viewModel::refreshUsb) { Text("Refresh") }
+                }
+            }
+        }
+
         // The one thing to do next. Always enabled unless something is running,
         // so it doubles as "retry" after a failure.
         Button(
@@ -117,12 +158,16 @@ fun SideloadScreen(
             Text("Start usbmuxd in Termux")
         }
 
-        if (!state.busy && !state.usbmuxdRunning) {
+        // termux-usb refuses to do anything without a device path, so the command
+        // can only be shown once the iPhone has actually been seen.
+        if (!state.busy && !state.usbmuxdRunning && state.usbDevicePath != null) {
             MessageCard(
-                title = "No usbmuxd yet",
-                body = state.detail,
-                actionLabel = "Copy Termux command",
-                onAction = { copyToClipboard(context, TermuxUsbmuxdLauncher.command()) },
+                title = "Or start it in Termux yourself",
+                body = TermuxUsbmuxdLauncher.command(state.usbDevicePath!!),
+                actionLabel = "Copy command",
+                onAction = {
+                    copyToClipboard(context, TermuxUsbmuxdLauncher.command(state.usbDevicePath!!))
+                },
             )
         }
 

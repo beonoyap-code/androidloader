@@ -50,34 +50,57 @@ object TermuxUsbmuxdLauncher {
     const val EXTRA_ARGUMENTS = "$TERMUX_PACKAGE.RUN_COMMAND_ARGUMENTS"
 
     /**
-     * The command to run inside Termux.
+     * The command that starts usbmuxd on [device].
      *
-     * @param device the USB path from `termux-usb -l`, or null to let
-     *   `termux-usb` pick the only attached device.
+     * The device path is not optional. `termux-usb` checks its positional
+     * arguments before doing anything and exits with "missing -l or device path"
+     * when there is none, so a path has to be supplied by the caller. The right
+     * value is `UsbDevice.getDeviceName`, which the USB host API already reports.
+     *
+     * How the descriptor travels is worth spelling out, because it is not what the
+     * flags suggest. `-e` does not run a shell command: it exports the command as
+     * `TERMUX_CALLBACK`. `-E` then sets `TERMUX_EXPORT_FD`, and the command is
+     * run with the claimed descriptor in its environment as `TERMUX_USB_FD`.
+     * Termux's libusb is patched to read exactly that variable and to use the one
+     * descriptor it names, rather than scanning `/dev/bus/usb` at all. Without it
+     * libusb looks for device nodes an app UID cannot open, which is the whole
+     * reason a plain usbmuxd cannot start.
      */
     fun command(
-        device: String? = null,
+        device: String,
         endpoint: UsbmuxEndpoint = UsbmuxEndpoint.DEFAULT,
     ): String {
+        require(device.isNotBlank()) { "termux-usb requires a device path" }
         val args = listOf(
             "usbmuxd",
+            // The daemon's default is a Unix socket inside Termux's private data
+            // directory, which an APK cannot open. Loopback is shared between
+            // apps, so it is the only transport the app can reach.
             "--socket", "${endpoint.host}:${endpoint.port}",
-            // No pidfile: Termux runs the process directly and does not need one,
-            // and it cannot write outside its own tree.
+            // No pidfile: the daemon runs in Termux's own tree and needs none.
             "--pidfile", "NONE",
-            // Foreground, because the daemon has to outlive the request.
+            // Foreground, since the daemon must outlive the request.
             "-f",
         ).joinToString(" ")
-        val target = device?.let { " \"$it\"" } ?: ""
-        return "termux-usb -r -E -e \"$args\"$target"
+        // -r raises the permission dialog when Termux:API does not already hold it;
+        // -E is what puts the descriptor in the environment rather than in argv.
+        return "termux-usb -r -E -e \"$args\" \"$device\""
     }
 
-    /** True when the Termux app is installed and visible to this process. */
-    fun isTermuxInstalled(context: Context): Boolean =
-        context.packageManager.queryIntentActivities(
-            Intent().setClassName(TERMUX_PACKAGE, SERVICE_CLASS),
-            0,
-        ).isNotEmpty()
+    /**
+     * True when the Termux app is installed and visible to this process.
+     *
+     * Looked up by package rather than by querying the service component: the
+     * run-command service is a Service, and `queryIntentServices` on it depends on
+     * the intent filter matching, so a package lookup is both simpler and the thing
+     * that actually answers "is Termux here".
+     */
+    fun isTermuxInstalled(context: Context): Boolean = try {
+        context.packageManager.getPackageInfo(TERMUX_PACKAGE, 0)
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        false
+    }
 
     /**
      * Whether this app holds the permission the service checks.
@@ -135,14 +158,13 @@ object TermuxUsbmuxdLauncher {
      */
     fun launch(
         context: Context,
-        device: String? = null,
+        device: String,
         endpoint: UsbmuxEndpoint = UsbmuxEndpoint.DEFAULT,
     ): LaunchResult {
         if (!isTermuxInstalled(context)) return LaunchResult.NotInstalled
         if (!hasPermission(context)) return LaunchResult.PermissionDenied
 
         val intent = runCommandIntent(command(device, endpoint))
-            ?: return LaunchResult.NotInstalled
 
         return try {
             // A Service, so startService, not startActivity.

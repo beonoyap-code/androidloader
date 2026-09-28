@@ -71,16 +71,39 @@ refuse, and no wrapper can force access the system will not grant.
 
 Pairing is cached per device, so later launches only need a session.
 
-## Two traps in the Termux intent
+## How the descriptor actually gets to usbmuxd
 
-Both fail with a message that points somewhere else, which is why they are worth
-writing down:
+This is the part that is genuinely not obvious, and getting it wrong produces
+errors that point somewhere else entirely.
+
+`termux-usb` requires a device path as a positional argument. With none it exits
+immediately with `missing -l or device path` — that is a `termux-usb` usage error,
+not a daemon failure. The app therefore finds the device itself through
+`UsbManager`, because `UsbDevice.getDeviceName()` already returns the usbfs path
+(`/dev/bus/usb/001/002`) that `termux-usb` wants.
+
+The flags are not what they look like:
+
+- `-e command` does **not** run a shell command. It exports the command as
+  `TERMUX_CALLBACK`.
+- `-E` sets `TERMUX_EXPORT_FD`, and the command then runs with the claimed
+  descriptor in its environment as `TERMUX_USB_FD`.
+- Termux's **libusb is patched** to read `TERMUX_USB_FD` and to use that single
+  descriptor, skipping the `/dev/bus/usb` scan entirely. Unpatched libusb looks
+  for device nodes an app UID cannot open, which is the entire reason a plain
+  `usbmuxd` cannot start.
+
+Two further traps in the run-command intent, both of which report themselves as
+something else:
 
 - The service is `com.termux.app.RunCommandService`, in the **Termux app**.
   Termux:API removed its own copy, so aiming at the old name raises
   `ActivityNotFoundException` — indistinguishable from "Termux is not installed".
 - It is a **Service**, so it must be started with `startService`. `startActivity`
   produces the same misleading error.
+
+And Termux refuses commands from other apps unless `allow-external-apps` is set,
+reporting the refusal only as a notification.
 
 ## What is implemented
 

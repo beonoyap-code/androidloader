@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import me.androidloader.lockdown.LockdownClient
 import me.androidloader.pairing.PairingStore
 import me.androidloader.termux.TermuxUsbmuxdLauncher
+import me.androidloader.termux.UsbDiscovery
 import me.androidloader.usbmux.UsbmuxClient
 import me.androidloader.usbmux.UsbmuxProtocol
 import me.androidloader.usbmux.UsbmuxSocketChannel
@@ -37,6 +38,14 @@ data class SideloadUiState(
             else -> "Not connected to usbmuxd"
         }
 
+    /** The usbfs path of the iPhone, once discovery has found one. */
+    var usbDevicePath: String? = null
+        private set
+
+    /** Human-readable note about the USB bus, shown above the buttons. */
+    var usbNote: String? = null
+        private set
+
     /**
      * What to tell the user next.
      *
@@ -48,9 +57,7 @@ data class SideloadUiState(
     val detail: String
         get() = when {
             busy -> progressMessage
-            !usbmuxdRunning ->
-                "Run usbmuxd in Termux, then tap Look for iPhone:\n\n" +
-                    TermuxUsbmuxdLauncher.command()
+            !usbmuxdRunning -> "Start usbmuxd, then tap Look for iPhone."
             devices.isEmpty() ->
                 "usbmuxd is running but sees no device. Check the cable carries data, " +
                     "and that the iPhone is unlocked."
@@ -72,6 +79,37 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
     val state: StateFlow<SideloadUiState> = _state.asStateFlow()
 
     private val usbmux = UsbmuxClient()
+
+    /**
+     * Refreshes what the USB host API can see.
+     *
+     * Separate from [lookForDevices] because the two answer different questions:
+     * one asks whether a cable is plugged in, the other whether a daemon is
+     * listening. Both matter, and conflating them produced an app that could not
+     * tell the user which half was missing.
+     */
+    fun refreshUsb() {
+        viewModelScope.launch {
+            val context = getApplication<Application>()
+            val found = UsbDiscovery.devices(context)
+            val apple = found.firstOrNull { it.isApple }
+            _state.update {
+                it.copy(
+                    usbDevicePath = apple?.path,
+                    usbNote = when {
+                        found.isEmpty() ->
+                            "No USB device is visible. Plug the iPhone into the OTG port " +
+                                "and unlock it."
+                        apple == null ->
+                            "No iPhone found. This phone sees " +
+                                found.joinToString { it.description } + "."
+                        apple.hasPermission -> "iPhone at ${apple.path}, permission granted."
+                        else -> "iPhone at ${apple.path}. Permission will be requested."
+                    },
+                )
+            }
+        }
+    }
 
     /**
      * Probes usbmuxd and lists devices.
@@ -115,23 +153,53 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
     /**
      * Asks Termux to start usbmuxd, then waits for it.
      *
-     * Best effort: on any failure the app still works, because the user can start
-     * the daemon themselves and tap Look for iPhone.
+     * Needs the iPhone's usbfs path, which `termux-usb` requires and will not
+     * discover for itself. The USB host API already reports it as
+     * `UsbDevice.getDeviceName`, so the app finds the device rather than parsing
+     * the output of a command it cannot run without the daemon it is trying to
+     * start.
      */
     fun startUsbmuxd() {
         viewModelScope.launch {
             _state.update { it.copy(error = null, hint = null) }
-            when (val result = TermuxUsbmuxdLauncher.launch(getApplication())) {
+            val context = getApplication<Application>()
+
+            val apple = UsbDiscovery.appleDevice(context)
+            if (apple == null) {
+                val seen = UsbDiscovery.devices(context)
+                append("no Apple device found on the USB bus")
+                _state.update {
+                    it.copy(
+                        hint = if (seen.isEmpty()) {
+                            "No USB device is visible to this app. Plug the iPhone into " +
+                                "the OTG port, unlock it, and make sure the cable carries " +
+                                "data rather than power only."
+                        } else {
+                            "No iPhone found. This phone sees ${seen.joinToString { it.description }}. " +
+                                "termux-usb can only claim a device this app can see."
+                        },
+                    )
+                }
+                return@launch
+            }
+            append("using ${apple.path} (${apple.description})")
+            if (!apple.hasPermission) {
+                UsbDiscovery.requestPermission(context, apple)
+            }
+
+            val manual = TermuxUsbmuxdLauncher.command(apple.path)
+            when (val result = TermuxUsbmuxdLauncher.launch(context, apple.path)) {
                 is TermuxUsbmuxdLauncher.LaunchResult.Started -> {
-                    append("asked Termux to start usbmuxd")
+                    append("asked Termux to start usbmuxd on ${apple.path}")
                     _state.update {
                         it.copy(
-                            hint = "If nothing happens, Termux is not allowed to run " +
-                                "commands from other apps yet:\n\n" +
-                                TermuxUsbmuxdLauncher.allowExternalAppsInstructions(),
+                            hint = "If nothing happens within a few seconds, Termux is not " +
+                                "allowed to run commands from other apps yet:\n\n" +
+                                TermuxUsbmuxdLauncher.allowExternalAppsInstructions() +
+                                "\n\nOr run this in Termux yourself:\n\n" + manual,
                         )
                     }
-                    waitForUsbmuxd()
+                    waitForUsbmuxd(manual)
                 }
                 else -> {
                     val explanation = TermuxUsbmuxdLauncher.explain(result)
@@ -139,8 +207,7 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                     _state.update {
                         it.copy(
                             hint = "$explanation\n\nYou can start it yourself in Termux:\n\n" +
-                                TermuxUsbmuxdLauncher.command() +
-                                "\n\nthen tap Look for iPhone.",
+                                manual + "\n\nthen tap Look for iPhone.",
                         )
                     }
                 }
@@ -152,11 +219,14 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
      * Polls for the daemon after a launch request.
      *
      * Termux:API returns as soon as the request is accepted, and the daemon takes a
-     * moment to bind its socket, so a single immediate probe would report a
-     * failure that is not one.
+     * moment to claim the device and bind its socket, so a single immediate probe
+     * would report a failure that is not one.
+     *
+     * @param manual the equivalent command, offered if the daemon never appears so
+     *   the user can see Termux's own error rather than guessing.
      */
-    private suspend fun waitForUsbmuxd() {
-        repeat(12) {
+    private suspend fun waitForUsbmuxd(manual: String) {
+        repeat(20) {
             kotlinx.coroutines.delay(500)
             if (runCatching { usbmux.connect() }.isSuccess) {
                 append("usbmuxd is up")
@@ -164,12 +234,11 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                 return
             }
         }
-        append("usbmuxd did not come up within about six seconds")
+        append("usbmuxd did not come up within about ten seconds")
         _state.update {
             it.copy(
-                hint = "usbmuxd did not start. Run this in Termux to see why:\n\n" +
-                    TermuxUsbmuxdLauncher.command(device = null, endpoint = me.androidloader.usbmux.UsbmuxEndpoint.DEFAULT)
-                        .replace(" -f", " -f -v"),
+                hint = "usbmuxd did not start. Run this in Termux to see its own error:\n\n" +
+                    manual.replace(" -f ", " -f -v "),
             )
         }
     }

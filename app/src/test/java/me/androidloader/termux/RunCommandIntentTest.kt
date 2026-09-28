@@ -1,6 +1,7 @@
 package me.androidloader.termux
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -37,6 +38,18 @@ class RunCommandIntentTest {
         // Termux reads this extra as an ArrayList<String>; a bare list is rejected.
         val args = intent.getStringArrayListExtra(TermuxUsbmuxdLauncher.EXTRA_ARGUMENTS)
         assertEquals(listOf("-lc", "echo hi"), args)
+    }
+
+    @Test
+    fun `the built command survives a round trip through the intent`() {
+        // The whole chain, so a device path is still present after it has been
+        // quoted, put in an extra, and read back out.
+        val device = "/dev/bus/usb/001/002"
+        val command = TermuxUsbmuxdLauncher.command(device = device)
+        val intent = TermuxUsbmuxdLauncher.runCommandIntent(command)!!
+        val args = intent.getStringArrayListExtra(TermuxUsbmuxdLauncher.EXTRA_ARGUMENTS)!!
+        assertTrue(args[1].contains(device))
+        assertTrue(args[1].contains("termux-usb"))
     }
 
     @Test

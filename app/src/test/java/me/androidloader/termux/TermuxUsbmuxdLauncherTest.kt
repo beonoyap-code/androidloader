@@ -6,86 +6,93 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Tests for the Termux run-command contract.
+ * Tests for the exact command handed to Termux.
  *
- * The command string and the intent component are the whole interface with
- * Termux:API. Getting either wrong fails in a way that looks like "Termux is not
- * installed", which is what made the earlier version so confusing, so both are
- * pinned here.
+ * Every one of these assertions is here because the corresponding thing was wrong
+ * at some point, and each failure mode pointed somewhere other than its cause:
+ * a missing device path looks like a broken daemon, and a wrong package looks
+ * like a phone without Termux on it.
  */
 class TermuxUsbmuxdLauncherTest {
 
+    private val path = "/dev/bus/usb/001/002"
+
     @Test
-    fun `targets the Termux app, not Termux API`() {
-        // Termux:API removed its RunCommandService. The one that exists is in the
-        // Termux package; aiming at the old one raises ActivityNotFoundException
-        // and reads as though Termux were absent.
-        assertEquals("com.termux", TermuxUsbmuxdLauncher.TERMUX_PACKAGE)
-        assertEquals("com.termux.app.RunCommandService", TermuxUsbmuxdLauncher.SERVICE_CLASS)
-        assertEquals("com.termux.permission.RUN_COMMAND", TermuxUsbmuxdLauncher.PERMISSION)
-        // The service is started with startService, not startActivity.
-        assertEquals("com.termux.RUN_COMMAND", TermuxUsbmuxdLauncher.ACTION)
+    fun `includes the device path termux-usb requires`() {
+        // termux-usb checks $# before anything else and exits with
+        // "missing -l or device path" when the argument is absent.
+        val command = TermuxUsbmuxdLauncher.command(device = path)
+        assertTrue(command, command.endsWith("\"$path\""))
+        assertTrue(command, command.contains(" $path"))
     }
 
     @Test
-    fun `builds the documented usbmuxd command`() {
-        val command = TermuxUsbmuxdLauncher.command(device = "/dev/bus/usb/001/002")
-        assertTrue(command, command.startsWith("termux-usb "))
-        // -r refreshes the device list, -E hands the claimed descriptor to the child.
+    fun `refuses to build a command with no device`() {
+        try {
+            TermuxUsbmuxdLauncher.command(device = "   ")
+            throw AssertionError("a blank device path should be rejected")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message!!.contains("device path"))
+        }
+    }
+
+    @Test
+    fun `uses the flags termux-usb documents`() {
+        val command = TermuxUsbmuxdLauncher.command(device = path)
+        // -r requests permission when Termux:API does not already hold it.
         assertTrue(command, command.contains(" -r "))
+        // -E passes the descriptor in TERMUX_USB_FD rather than as argv, which is
+        // what Termux's patched libusb reads.
         assertTrue(command, command.contains(" -E "))
-        assertTrue(command, command.contains("usbmuxd"))
-        assertTrue(command, command.contains("/dev/bus/usb/001/002"))
+        assertTrue(command, command.contains(" -e "))
     }
 
     @Test
-    fun `uses loopback tcp because the default unix socket is unreachable`() {
-        val command = TermuxUsbmuxdLauncher.command(device = "/dev/bus/usb/001/002")
+    fun `runs usbmuxd with the loopback socket`() {
+        val command = TermuxUsbmuxdLauncher.command(device = path)
         // The daemon's default is a Unix socket inside Termux's private data
-        // directory, which the app cannot open. Loopback is shared between apps.
-        assertTrue(command, command.contains("127.0.0.1:27015"))
-        assertTrue(command, command.contains("--socket"))
-    }
-
-    @Test
-    fun `disables the pidfile because writing outside Termux is not permitted`() {
-        val command = TermuxUsbmuxdLauncher.command(device = "/dev/bus/usb/001/002")
+        // directory, which an APK cannot open. Loopback is shared between apps.
+        assertTrue(command, command.contains("--socket 127.0.0.1:27015"))
         assertTrue(command, command.contains("--pidfile NONE"))
-    }
-
-    @Test
-    fun `omits the device when none is given`() {
-        val command = TermuxUsbmuxdLauncher.command(device = null)
-        assertTrue(command, command.contains("termux-usb"))
-        assertTrue("should not name a device: $command", !command.contains("/dev/bus/usb"))
+        assertTrue(command, command.contains("usbmuxd"))
     }
 
     @Test
     fun `honours a custom endpoint`() {
         val command = TermuxUsbmuxdLauncher.command(
-            device = "/dev/bus/usb/001/002",
+            device = path,
             endpoint = me.androidloader.usbmux.UsbmuxEndpoint("127.0.0.1", 27016),
         )
-        assertTrue(command, command.contains("127.0.0.1:27016"))
+        assertTrue(command, command.contains("--socket 127.0.0.1:27016"))
     }
 
     @Test
-    fun `quotes the command passed to termux-usb -e`() {
-        // Termux:API hands everything after -e to the shell verbatim, so the inner
-        // command has to stay a single quoted argument.
-        val command = TermuxUsbmuxdLauncher.command(device = "/dev/bus/usb/001/002")
+    fun `quotes the command and the device so the shell keeps them intact`() {
+        val command = TermuxUsbmuxdLauncher.command(device = path)
         val quoted = Regex("-e \"([^\"]*)\"").find(command)
         assertTrue("expected a quoted -e argument in: $command", quoted != null)
         assertTrue(quoted!!.groupValues[1].contains("usbmuxd"))
     }
 
     @Test
-    fun `each failure explains its own remedy`() {
+    fun `addresses the Termux app, not Termux API`() {
+        // Termux:API removed its RunCommandService. The one that exists is
+        // com.termux.app.RunCommandService in the Termux package, exported and
+        // guarded by com.termux.permission.RUN_COMMAND.
+        assertEquals("com.termux", TermuxUsbmuxdLauncher.TERMUX_PACKAGE)
+        assertEquals("com.termux.app.RunCommandService", TermuxUsbmuxdLauncher.SERVICE_CLASS)
+        assertEquals("com.termux.permission.RUN_COMMAND", TermuxUsbmuxdLauncher.PERMISSION)
+        assertEquals("com.termux.RUN_COMMAND", TermuxUsbmuxdLauncher.ACTION)
+    }
+
+    @Test
+    fun `explains each failure without claiming Termux is missing`() {
+        // The previous wording said "Termux is not installed" on a phone that had
+        // Termux on it, because a service component was looked up with
+        // queryIntentActivities, which only ever returns activities.
         val notInstalled = TermuxUsbmuxdLauncher.explain(
             TermuxUsbmuxdLauncher.LaunchResult.NotInstalled,
         )
-        // The message must not claim Termux is absent: the app cannot tell, and
-        // saying so when it is installed is what caused the earlier confusion.
         assertFalse(notInstalled, notInstalled.contains("is not installed"))
         assertTrue(notInstalled, notInstalled.contains("Look for iPhone"))
 
@@ -94,11 +101,11 @@ class TermuxUsbmuxdLauncherTest {
         )
         assertTrue(denied, denied.contains(TermuxUsbmuxdLauncher.PERMISSION))
 
-        val failed = TermuxUsbmuxdLauncher.explain(
-            TermuxUsbmuxdLauncher.LaunchResult.Failed("boom"),
+        assertTrue(
+            TermuxUsbmuxdLauncher.explain(
+                TermuxUsbmuxdLauncher.LaunchResult.Failed("boom"),
+            ).contains("boom"),
         )
-        assertTrue(failed, failed.contains("boom"))
-
         assertEquals(
             "",
             TermuxUsbmuxdLauncher.explain(TermuxUsbmuxdLauncher.LaunchResult.Started),
@@ -106,7 +113,7 @@ class TermuxUsbmuxdLauncherTest {
     }
 
     @Test
-    fun `documents the external apps setting Termux silently requires`() {
+    fun `documents the setting Termux silently requires`() {
         val instructions = TermuxUsbmuxdLauncher.allowExternalAppsInstructions()
         assertTrue(instructions, instructions.contains("allow-external-apps"))
         assertTrue(instructions, instructions.contains("termux.properties"))

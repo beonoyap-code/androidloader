@@ -1,10 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Apple vendor ID. A filter is not required to talk to usbmuxd on TCP, but it lets
-  Android offer the app when an iPhone is attached to the OTG port.
+  Apple USB IDs, written in decimal because that is what the manifest attribute
+  takes, not the hexadecimal form they are usually written in.
+
+  1452   = 0x05AC, Apple's vendor ID
+  4776   = 0x12A8, iPhone in normal mode, the one that carries usbmuxd
+  4779   = 0x12AB, recovery mode
+  4780   = 0x12AC, iPad in normal mode
+
+  This filter only affects the system's "USB device attached" notification; the app
+  finds the device itself through UsbManager and does not depend on it.
 -->
 <resources>
-    <usb-device vendor-id="1452" product-id="4778" />
+    <usb-device vendor-id="1452" product-id="4776" />
     <usb-device vendor-id="1452" product-id="4779" />
-    <usb-device vendor-id="1452" product-id="4736" />
+    <usb-device vendor-id="1452" product-id="4780" />
 </resources>
