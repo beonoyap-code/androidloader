@@ -2,14 +2,18 @@ package me.androidloader.lockdown
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import me.androidloader.pairing.HostCertificateSet
+import me.androidloader.pairing.PairingIdentity
 import me.androidloader.pairing.PairingRecord
+import me.androidloader.pairing.Pem
 import me.androidloader.plist.PlistCodec
 import me.androidloader.plist.PlistValue
+import me.androidloader.plist.asData
 import me.androidloader.plist.asString
 import me.androidloader.plist.plistBool
+import me.androidloader.plist.plistDict
 import me.androidloader.plist.plistString
 import me.androidloader.plist.string
+import me.androidloader.pairing.HostIdentity
 import me.androidloader.usbmux.ServiceFraming
 import me.androidloader.usbmux.UsbmuxClient
 import me.androidloader.usbmux.UsbmuxProtocol
@@ -32,87 +36,62 @@ data class QueryType(
 }
 
 /**
- * A live session with lockdownd on one device.
+ * A live session with lockdownd.
  *
- * lockdownd gates every privileged operation, and the sequence is strictly ordered:
+ * The flow is entirely plaintext until the very end, which is the part that is
+ * easy to get wrong:
  *
  *  1. connect over usbmux
- *  2. `StartPairing`, which switches the socket to TLS using the host certificate
- *  3. `Pair`, registering this host with the device
- *  4. `StartSession`, opening the privileged session that install and file
- *     operations later require
+ *  2. read the device's public key with `GetValue`
+ *  3. mint a root and host certificate locally
+ *  4. send `Pair` **in plaintext**, carrying those certificates
+ *  5. the device shows its trust prompt and returns the full record
+ *  6. `StartSession`; TLS is enabled afterwards, for later requests
  *
- * The pairing request is special: it must be written to the *plain* channel
- * before TLS is switched on. Once paired, every subsequent request goes through the
- * TLS channel. Modelling this as a transport swap on one object keeps the ordering
- * explicit instead of spreading it across separate types.
+ * There is no `StartPairing`, and no TLS before step 4. An earlier version of this
+ * code began a TLS handshake immediately, with a trust manager anchored on the
+ * pairing root, which at that point we do not have. lockdownd received a
+ * ClientHello where it expected a property list, the handshake failed, and because
+ * the trust prompt is raised by the `Pair` request, no prompt ever appeared.
  */
 class LockdownClient private constructor(
     private val device: UsbmuxProtocol.Device,
-    private var transport: Transport,
+    private val channel: UsbmuxSocketChannel,
 ) : Closeable {
-
-    /** Abstraction over the plain and TLS phases so requests have one code path. */
-    private sealed interface Transport : Closeable {
-        fun write(buffer: ByteArray, offset: Int, length: Int)
-        suspend fun readMessage(): ByteArray
-    }
-
-    private class Plain(val channel: UsbmuxSocketChannel) : Transport {
-        override fun write(buffer: ByteArray, offset: Int, length: Int) =
-            channel.write(buffer, offset, length)
-
-        override suspend fun readMessage(): ByteArray = channel.readOneMessage()
-        override fun close() = channel.close()
-    }
-
-    private class Secure(private val channel: TlsChannel) : Transport {
-        override fun write(buffer: ByteArray, offset: Int, length: Int) =
-            channel.write(buffer, offset, length)
-
-        override suspend fun readMessage(): ByteArray = channel.readOne()
-        override fun close() = channel.close()
-    }
 
     /** Set once a privileged session is open; required for install and file access. */
     var sessionId: String? = null
         private set
 
-    /** The pairing record in force for this connection. */
+    /** The pairing record in force, once one is known. */
     var record: PairingRecord? = null
         private set
 
-    /** The device this session is bound to. */
     val boundDevice: UsbmuxProtocol.Device get() = device
 
-    /**
-     * Opens a lockdownd connection to [device].
-     *
-     * No TLS is established yet: the caller decides whether to pair, start a
-     * session, or issue an unpaired request such as `QueryType`.
-     */
+    /** Opens a lockdownd connection to [device] over the plain socket. */
     suspend fun connect(
         usbmux: UsbmuxClient,
         device: UsbmuxProtocol.Device,
     ): LockdownClient = withContext(Dispatchers.IO) {
         val socket = usbmux.connectTo(device, UsbmuxClient.PORT_LOCKDOWN)
-        LockdownClient(device, Plain(UsbmuxSocketChannel(socket)))
+        LockdownClient(device, UsbmuxSocketChannel(socket))
     }
 
+    /**
+     * Binds a client to an already-open channel and device.
+     *
+     * The usbmux path uses [connect]. This exists so the protocol can be driven
+     * over a socket obtained elsewhere, which is what the tests use in place of
+     * real hardware.
+     */
     companion object {
-        /**
-         * Binds a client to an already-open channel and device.
-         *
-         * The usbmux path uses [connect], which owns the socket it opens. This
-         * factory exists so the protocol can be driven over a socket obtained
-         * elsewhere, which is what the tests use in place of real hardware.
-         */
         fun onChannel(
             device: UsbmuxProtocol.Device,
             channel: UsbmuxSocketChannel,
-        ): LockdownClient = LockdownClient(device, Plain(channel))
+        ): LockdownClient = LockdownClient(device, channel)
 
-        /** Identifies this host to lockdownd; appears in the device's trust list. */
+        /** Identifies this host to lockdownd. */
         const val LABEL = "androidloader"
 
         /** Turns a lockdownd error code into something the user can act on. */
@@ -120,187 +99,176 @@ class LockdownClient private constructor(
             "PasswordProtected" ->
                 "The iPhone is locked with a passcode. Unlock it, then try again."
             "InvalidHostID" ->
-                "This Android device is no longer trusted. Erase the pairing record and pair again."
+                "This phone is no longer trusted. Pair again to fix it."
             "InvalidService" -> "The iPhone refused the requested service."
             "SetSessionDisabled" ->
-                "Developer Mode or the lockdown service is disabled. Turn on Developer Mode " +
-                    "in iOS Settings, then reconnect."
+                "Developer Mode is off. Turn it on in Settings, then reconnect."
             "DeviceLockComplete" -> "The iPhone is locked. Unlock it and try again."
+            "UserDeniedPairing" ->
+                "Pairing was declined on the iPhone. Tap Pair and then Trust when prompted."
             else -> buildString {
-                append("lockdownd error ")
-                append(code)
-                if (!detail.isNullOrBlank()) append(": ").append(detail)
+                append("lockdownd refused the request: ").append(code)
+                if (!detail.isNullOrBlank()) append(" (").append(detail).append(')')
             }
         }
     }
 
-    /**
-     * Sends one plist request and returns the response body.
-     *
-     * `Label` and `ProtocolVersion` are always present because current lockdownd
-     * rejects requests without them.
-     */
-    suspend fun request(body: Map<String, PlistValue>): Map<String, PlistValue> =
+    /** Sends one plist request over the plain channel and returns the reply. */
+    private suspend fun exchange(body: Map<String, PlistValue>): Map<String, PlistValue> =
         withContext(Dispatchers.IO) {
-            val full = buildMap {
-                putAll(body)
-                put("Label", plistString(LABEL))
-                put("ProtocolVersion", plistString("2"))
-                sessionId?.let { put("SessionID", plistString(it)) }
-            }
-            val framed = ServiceFraming.plistFrame(full)
-            transport.write(framed, 0, framed.size)
-            val parsed = PlistCodec.decodeDict(transport.readMessage())
+            val framed = ServiceFraming.plistFrame(
+                buildMap {
+                    putAll(body)
+                    put("Label", plistString(LABEL))
+                    put("ProtocolVersion", plistString("2"))
+                    sessionId?.let { put("SessionID", plistString(it)) }
+                },
+            )
+            channel.write(framed, 0, framed.size)
+            val parsed = PlistCodec.decodeDict(channel.readOneMessage())
             val error = parsed.string("Error")
             if (error != null) {
-                throw LockdownException(
-                    lockdownErrorMessage(error, parsed.string("ErrorDescription")),
-                )
+                throw LockdownException(lockdownErrorMessage(error, parsed.string("ErrorDescription")))
             }
             parsed
         }
 
-    /** Reports which value domain lockdownd is in and whether pairing is required. */
+    /** Reports the value domain lockdownd is in. */
     suspend fun queryType(): QueryType {
-        val reply = request(mapOf("Request" to plistString("QueryType")))
+        val reply = exchange(mapOf("Request" to plistString("QueryType")))
         val type = reply["Type"]?.asString
             ?: throw LockdownException("lockdownd did not report a value domain")
         val prohibited = reply["PairingProhibited"]
         return QueryType(
             type = type,
-            // Absent means pairing is allowed, which is the common case.
             requiresPairing = prohibited !is PlistValue.BoolValue || prohibited.value,
         )
     }
 
     /**
-     * Performs the TLS handshake, registers this host, and switches the transport.
+     * Pairs with the device, in plaintext.
      *
-     * The user must accept the trust prompt on the iPhone while this runs. A
-     * refusal arrives as an [LockdownException] rather than a hang.
+     * The trust prompt appears on the iPhone while this is in flight, so it must
+     * not be called with the device locked, and a refusal comes back as an error
+     * rather than a timeout.
      *
-     * @return the pairing record lockdownd issued, which supersedes any cached one.
+     * @param identifiers the host id and system BUID to register. Reusing the same
+     *   values across pairings keeps the device's trust list from growing.
      */
-    suspend fun pair(cached: PairingRecord?): PairingRecord = withContext(Dispatchers.IO) {
-        val plain = transport as? Plain
-            ?: throw LockdownException("this connection has already been paired")
-        // A cached record supplies the host identity; otherwise a fresh one is
-        // minted. Either way the device returns the authoritative record below.
-        val seed = cached ?: HostCertificateSet.generate().toRecord(device)
-        val tls = LockdownTls.wrap(plain.channel, seed, device)
-        tls.handshake()
-
-        val reply = try {
-            exchangeTls(
-                tls,
-                mapOf(
-                    "Request" to plistString("Pair"),
-                    "ExtendedPairingErrors" to plistBool(true),
-                ),
+    suspend fun pair(
+        hostId: String = PairingIdentity.newHostId(),
+        systemBuid: String = PairingIdentity.newSystemBuid(),
+    ): PairingRecord = withContext(Dispatchers.IO) {
+        // The device's public key is needed to finish the record after pairing, and
+        // reading it now is what the reference does before generating anything.
+        val devicePublicKey = try {
+            request("DevicePublicKey")
+                ?: throw LockdownException("the iPhone did not return its public key")
+        } catch (e: LockdownException) {
+            throw LockdownException(
+                "The iPhone refused to share its public key. Make sure it is unlocked " +
+                    "and that Developer Mode is on.",
+                e,
             )
-        } catch (e: Exception) {
-            tls.close()
-            throw e
         }
 
-        // lockdownd returns the authoritative record; a cached copy can be stale or
-        // malformed, so prefer the device's.
+        // The Wi-Fi address is read before pairing on purpose: the reference notes
+        // that asking for it afterwards fails on iOS 7-era devices.
+        val wifi = runCatching { request("WiFiAddress") }.getOrNull()
+
+        val identity = HostIdentity.generate()
+
+        val seed = PairingRecord(
+            deviceCertificate = ByteArray(0),
+            devicePublicKey = devicePublicKey,
+            hostCertificate = Pem.encode(identity.hostCertificate),
+            hostPrivateKey = Pem.encodePrivate(identity.hostPrivateKey),
+            hostPublicKey = Pem.encodePublic(identity.hostPublicKey),
+            rootCertificate = Pem.encode(identity.rootCertificate),
+            rootPrivateKey = Pem.encodePrivate(identity.rootPrivateKey),
+            hostId = hostId,
+            systemBuid = systemBuid,
+            wifiMacAddress = wifi?.let { String(it, Charsets.UTF_8) },
+        )
+
+        val reply = exchange(
+            mapOf(
+                "Request" to plistString("Pair"),
+                "PairRecord" to PlistValue.DictValue(seed.toPairingRequest()),
+                "PairingOptions" to plistDict(
+                    mapOf("ExtendedPairingErrors" to plistBool(true)),
+                ),
+            ),
+        )
+
         val returned = (reply["PairRecordData"] as? PlistValue.DataValue)?.value
-        val adopted = returned?.let { PairingRecord.parse(it) } ?: seed
-        this@LockdownClient.record = adopted
-        transport = Secure(tls)
+        val adopted = returned?.let { PairingRecord.parse(it) }
+            ?: throw LockdownException(
+                "The iPhone accepted the pairing but returned no record. Erase it from " +
+                    "Settings, General, Transfer or Reset, Reset, and try again.",
+            )
+        record = adopted
         adopted
-    }
-
-    /**
-     * Adopts a pairing record that was stored earlier, switching the transport to
-     * TLS without re-pairing. Used on the common path where the device is already
-     * paired and only a session needs opening.
-     */
-    suspend fun adoptExisting(record: PairingRecord) = withContext(Dispatchers.IO) {
-        val plain = transport as? Plain
-            ?: throw LockdownException("this connection has already been paired")
-        val tls = LockdownTls.wrap(plain.channel, record, device)
-        tls.handshake()
-        this@LockdownClient.record = record
-        transport = Secure(tls)
-    }
-
-    /**
-     * Opens a TLS session and, when a record is available, a privileged session.
-     *
-     * This is the common path: a device that has already been paired needs only
-     * [adoptExisting] followed by [startSession]. A device with no stored record
-     * needs [pair] first, which is why the two are kept separate rather than folded
-     * into one call that could silently re-pair.
-     */
-    suspend fun openSession(stored: PairingRecord?): PairingRecord = withContext(Dispatchers.IO) {
-        val established = if (stored != null) {
-            adoptExisting(stored)
-            stored
-        } else {
-            pair(null)
-        }
-        startSession()
-        established
-    }
-
-    /** Sends [body] over the freshly established TLS channel. */
-    private suspend fun exchangeTls(
-        tls: TlsChannel,
-        body: Map<String, PlistValue>,
-    ): Map<String, PlistValue> {
-        val framed = ServiceFraming.plistFrame(
-            buildMap {
-                putAll(body)
-                put("Label", plistString(LABEL))
-                put("ProtocolVersion", plistString("2"))
-            },
-        )
-        tls.write(framed, 0, framed.size)
-        val parsed = PlistCodec.decodeDict(tls.readOne())
-        val error = parsed.string("Error")
-        if (error != null) {
-            throw LockdownException(lockdownErrorMessage(error, parsed.string("ErrorDescription")))
-        }
-        return parsed
-    }
-
-    /**
-     * Opens a privileged session. Fails when the device is locked or the pairing
-     * record is no longer trusted, which are the two conditions that actually
-     * produce this error in practice.
-     */
-    suspend fun startSession() = withContext(Dispatchers.IO) {
-        val reply = request(mapOf("Request" to plistString("StartSession")))
-        sessionId = reply.string("SessionID") ?: throw LockdownException(
-            "the device refused to open a session. It is most likely locked, or this " +
-                "computer is no longer trusted. Unlock the iPhone and pair again if needed.",
-        )
     }
 
     /** Reads one device property. */
     suspend fun getValue(key: String): PlistValue? =
-        request(mapOf("Request" to plistString("GetValue"), "Key" to plistString(key)))[key]
+        exchange(mapOf("Request" to plistString("GetValue"), "Key" to plistString(key)))[key]
+
+    suspend fun request(key: String): ByteArray? = getValue(key)?.asData
 
     suspend fun getString(key: String): String? = getValue(key)?.asString
 
     /** Every readable device property. */
     suspend fun deviceInfo(): Map<String, String> = withContext(Dispatchers.IO) {
-        request(mapOf("Request" to plistString("GetValue")))
+        exchange(mapOf("Request" to plistString("GetValue")))
             .mapNotNull { (k, v) -> v.asString?.let { k to it } }
             .toMap()
     }
 
     /**
-     * The TLS version to request, read from the device when it advertises one.
+     * Opens a privileged session.
      *
-     * lockdownd on some iOS builds refuses a handshake that offers only TLS 1.3,
-     * so this is honoured rather than left to platform defaults.
+     * Fails when the device is locked or the host is no longer trusted, which are
+     * the two conditions that actually produce this.
      */
-    suspend fun preferredTlsVersion(): String? = getString("ssl_protocol_version")
+    suspend fun startSession() = withContext(Dispatchers.IO) {
+        val hostId = record?.hostId
+            ?: throw LockdownException("no pairing record; pair before starting a session")
+        val reply = exchange(
+            mapOf(
+                "Request" to plistString("StartSession"),
+                "HostID" to plistString(hostId),
+            ),
+        )
+        sessionId = reply.string("SessionID") ?: throw LockdownException(
+            "the iPhone refused to open a session. It is most likely locked, or this " +
+                "phone is no longer trusted. Pair again if that persists.",
+        )
+    }
+
+    /**
+     * Pairs if needed, then opens a session.
+     *
+     * The common path for the caller: a device with no record is paired, and one
+     * that already has a record is used as is.
+     */
+    suspend fun openSession(
+        existing: PairingRecord?,
+        hostId: String,
+        systemBuid: String,
+    ): PairingRecord = withContext(Dispatchers.IO) {
+        val established = if (existing != null) {
+            record = existing
+            existing
+        } else {
+            pair(hostId, systemBuid)
+        }
+        startSession()
+        established
+    }
 
     override fun close() {
-        transport.close()
+        channel.close()
     }
 }

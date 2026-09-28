@@ -61,6 +61,39 @@ Find the device path with `termux-usb -l`. If no device appears, check that the
 cable carries data and that the phone accepts OTG; some vendor kernels still
 refuse, and no wrapper can force access the system will not grant.
 
+## How pairing actually works
+
+The trust prompt is raised by the `Pair` **request**, not by the TLS handshake. An
+earlier version of this app started a TLS handshake before sending anything, so
+the prompt never appeared and the failure looked like a certificate problem.
+
+There is no `StartPairing` step, and no TLS before `Pair`. The sequence is:
+
+1. Connect to lockdownd on port 62078, in plaintext.
+2. `GetValue` for `DevicePublicKey`.
+3. Generate locally: an RSA-2048 root CA and a host certificate, **PEM** encoded.
+4. Send `Pair` in **plaintext**, with a `PairRecord` dictionary containing the
+   public parts only — the private keys are stripped, since they never leave the
+   device.
+5. The iPhone shows its trust prompt and returns the full record, including the
+   device certificate and the host's own keys.
+6. `StartSession` with the `HostID`. TLS is enabled afterwards, for later
+   requests.
+
+Three details are dictated by lockdownd rather than chosen, and each fails as an
+unexplained "pairing failed" when wrong:
+
+- **RSA 2048**, not EC.
+- **PEM**, not DER. The record fields are PEM text, so DER fails to parse as a
+  certificate at all.
+- A **`HostID`**, which is what `StartSession` is keyed on. It is persisted per
+  install, because generating a fresh one each time leaves entries in the
+  device's trust list the user cannot see or remove.
+
+The root is `CA:TRUE` with no key usage; the host leaf is `CA:FALSE` with
+`digitalSignature, keyEncipherment`. Both use serial 0 and ten-year validity, as
+libimobiledevice does.
+
 ## Using the app
 
 1. Start usbmuxd — either tap **Start usbmuxd in Termux**, or run the command
@@ -112,8 +145,8 @@ reporting the refusal only as a notification.
 | usbmuxd wire protocol, framing, device list | complete, unit tested |
 | Service framing (length-prefixed messages) | complete, unit tested |
 | Property lists: XML encode/decode, binary decode | complete, unit tested |
-| lockdownd session, pairing, TLS with the pairing root | complete |
-| Pairing record storage, host identity generation | complete |
+| lockdownd session and pairing, over plaintext as lockdownd expects | complete |
+| Pairing record storage, host identity generation, PEM encoding | complete |
 | Termux:API launcher, package visibility | complete |
 | AFC file transfer | written, untested against hardware |
 | `installation_proxy` install and uninstall | written, untested against hardware |

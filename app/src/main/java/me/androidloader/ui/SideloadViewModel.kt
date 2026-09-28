@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.androidloader.lockdown.LockdownClient
+import me.androidloader.pairing.PairingIdentity
 import me.androidloader.pairing.PairingStore
 import me.androidloader.termux.TermuxUsbmuxdLauncher
 import me.androidloader.termux.UsbDiscovery
@@ -237,32 +238,33 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
     fun pair(udid: String) {
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null, progressMessage = "Pairing") }
+            val context = getApplication<Application>()
             try {
-                // Records hold DER certificates and keys, so this is file I/O and
-                // must not run on the main thread.
-                val stored = withContext(Dispatchers.IO) {
-                    PairingStore.load(getApplication(), udid)
-                }
-                append(
-                    if (stored == null) "no saved pairing, pairing now"
-                    else "using the saved pairing",
-                )
+                val stored = withContext(Dispatchers.IO) { PairingStore.load(context, udid) }
                 usbmux.connect()
                 val device = usbmux.listDevices().firstOrNull { it.udid == udid }
                     ?: error("the iPhone is no longer connected")
                 val socket = usbmux.connectTo(device, UsbmuxClient.PORT_LOCKDOWN)
                 val lockdown = LockdownClient.onChannel(device, UsbmuxSocketChannel(socket))
                 try {
-                    val result = lockdown.openSession(stored)
-                    withContext(Dispatchers.IO) {
-                        PairingStore.save(getApplication(), udid, result)
+                    // Pairing raises the trust prompt on the iPhone, so say so
+                    // before waiting on it rather than after.
+                    _state.update {
+                        it.copy(progressMessage = "Accept the trust prompt on the iPhone")
                     }
-                    append("paired and started a session")
+                    val identity = withContext(Dispatchers.IO) {
+                        PairingIdentity.load(context)
+                    }
+                    val result = lockdown.openSession(stored, identity.hostId, identity.systemBuid)
+                    withContext(Dispatchers.IO) {
+                        PairingStore.save(context, udid, result)
+                    }
+                    append(if (stored == null) "paired" else "reused the saved pairing")
                     _state.update {
                         it.copy(
                             busy = false,
                             progressMessage = "",
-                            hint = "Paired with $udid.",
+                            hint = "Paired and ready. Next: installing an IPA.",
                         )
                     }
                 } finally {
