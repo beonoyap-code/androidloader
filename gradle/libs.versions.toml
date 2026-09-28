@@ -5,6 +5,8 @@ coreKtx = "1.13.1"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
 composeBom = "2024.10.01"
+# Compose BOM 2024.10.01 maps to ui 1.7.5.
+composeUi = "1.7.5"
 navigation = "2.8.4"
 datastore = "1.1.1"
 bouncycastle = "1.78.1"
@@ -38,7 +40,8 @@ junit = { module = "junit:junit", version.ref = "junit" }
 robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTest" }
 compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4", version.ref = "composeBom" }
-compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest", version.ref = "composeBom" }
+# Not managed by the Compose BOM, so it needs the ui version explicitly.
+compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest", version.ref = "composeUi" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
