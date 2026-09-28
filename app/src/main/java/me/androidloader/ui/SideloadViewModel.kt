@@ -3,11 +3,13 @@ package me.androidloader.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.androidloader.lockdown.LockdownClient
 import me.androidloader.pairing.PairingStore
 import me.androidloader.termux.TermuxUsbmuxdLauncher
@@ -63,20 +65,23 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
 
     fun startUsbmuxd() {
         viewModelScope.launch {
-            val launched = TermuxUsbmuxdLauncher.launch(getApplication())
-            if (!launched) {
-                fail(
-                    "Could not start usbmuxd. Install Termux and Termux:API from F-Droid, " +
-                        "then run in Termux:\n" +
-                        "pkg install usbmuxd libimobiledevice\n" +
-                        TermuxUsbmuxdLauncher.command(),
-                )
-                return@launch
+            when (val result = TermuxUsbmuxdLauncher.launch(getApplication())) {
+                is TermuxUsbmuxdLauncher.LaunchResult.Started -> {
+                    append("Asked Termux to start usbmuxd")
+                    // The daemon needs a moment to bind its socket; poll briefly
+                    // rather than reporting failure on the first refused
+                    // connection.
+                    pollForUsbmuxd()
+                }
+                else -> {
+                    val explanation = TermuxUsbmuxdLauncher.explain(result)
+                    append("launch failed: $explanation")
+                    fail(
+                        explanation + "\n\nIf Termux is set up, run this by hand instead:\n" +
+                            TermuxUsbmuxdLauncher.command(),
+                    )
+                }
             }
-            append("Asked Termux to start usbmuxd")
-            // The daemon needs a moment to bind its socket; poll briefly rather
-            // than reporting failure on the first refused connection.
-            pollForUsbmuxd()
         }
     }
 
@@ -131,7 +136,11 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null, progressMessage = "Pairing") }
             try {
-                val stored = me.androidloader.pairing.PairingStore.load(getApplication(), udid)
+                // Pairing records hold DER certificates and keys, so reading and
+                // writing them is file I/O and must not run on the main thread.
+                val stored = withContext(Dispatchers.IO) {
+                    PairingStore.load(getApplication(), udid)
+                }
                 append(
                     if (stored == null) "no saved pairing, pairing now"
                     else "using the saved pairing",
@@ -142,7 +151,9 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                 val socket = usbmux.connectTo(device, UsbmuxClient.PORT_LOCKDOWN)
                 val lockdown = LockdownClient.onChannel(device, UsbmuxSocketChannel(socket))
                 val result = lockdown.openSession(stored)
-                PairingStore.save(getApplication(), udid, result)
+                withContext(Dispatchers.IO) {
+                    PairingStore.save(getApplication(), udid, result)
+                }
                 append("paired and started a session")
                 _state.update { it.copy(busy = false, progressMessage = "") }
                 lockdown.close()

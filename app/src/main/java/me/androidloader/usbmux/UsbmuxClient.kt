@@ -60,45 +60,56 @@ class UsbmuxClient(
     /**
      * Opens the control connection.
      *
+     * Suspending, and dispatched to [Dispatchers.IO], because this performs
+     * blocking socket I/O. The view model drives the flow from the main
+     * dispatcher, so a non-suspending version would throw
+     * `NetworkOnMainThreadException` the moment it was called.
+     *
      * A refused connection is reported with the Termux command needed to start the
      * daemon, because "connection refused" here almost always means usbmuxd simply
      * is not running yet.
      */
-    fun connect() = withControl {
-        if (isConnected) return@withControl
-        try {
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.soTimeout = readTimeoutMs
-            s.connect(InetSocketAddress(endpoint.host, endpoint.port), connectTimeoutMs)
-            socket = s
-            input = s.getInputStream()
-            output = s.getOutputStream()
-            reader.reset()
-        } catch (e: java.net.ConnectException) {
-            throw UsbmuxUnavailableException(
-                "Nothing is listening on ${endpoint.host}:${endpoint.port}. " +
-                    "Start usbmuxd in Termux first: " +
-                    "termux-usb -r -E -e \"usbmuxd --socket ${endpoint.host}:${endpoint.port} " +
-                    "--pidfile NONE -f\" /dev/bus/usb/001/002",
-                e,
-            )
-        } catch (e: SocketTimeoutException) {
-            throw UsbmuxUnavailableException(
-                "Timed out connecting to usbmuxd at ${endpoint.host}:${endpoint.port}. " +
-                    "Check that usbmuxd is running in Termux.",
-                e,
-            )
-        } catch (e: java.io.IOException) {
-            throw UsbmuxUnavailableException(
-                "Could not reach usbmuxd at ${endpoint.host}:${endpoint.port}: ${e.message}",
-                e,
-            )
+    suspend fun connect() = withContext(Dispatchers.IO) { openControlConnection() }
+
+    /** The blocking half of [connect]; callers must already be on an IO thread. */
+    private fun openControlConnection() {
+        withControl {
+            if (isConnected) return
+            try {
+                val s = Socket()
+                s.tcpNoDelay = true
+                s.soTimeout = readTimeoutMs
+                s.connect(InetSocketAddress(endpoint.host, endpoint.port), connectTimeoutMs)
+                socket = s
+                input = s.getInputStream()
+                output = s.getOutputStream()
+                reader.reset()
+            } catch (e: java.net.ConnectException) {
+                throw UsbmuxUnavailableException(
+                    "Nothing is listening on ${endpoint.host}:${endpoint.port}. " +
+                        "Start usbmuxd in Termux first: " +
+                        "termux-usb -r -E -e \"usbmuxd --socket ${endpoint.host}:${endpoint.port} " +
+                        "--pidfile NONE -f\" /dev/bus/usb/001/002",
+                    e,
+                )
+            } catch (e: SocketTimeoutException) {
+                throw UsbmuxUnavailableException(
+                    "Timed out connecting to usbmuxd at ${endpoint.host}:${endpoint.port}. " +
+                        "Check that usbmuxd is running in Termux.",
+                    e,
+                )
+            } catch (e: java.io.IOException) {
+                throw UsbmuxUnavailableException(
+                    "Could not reach usbmuxd at ${endpoint.host}:${endpoint.port}: ${e.message}",
+                    e,
+                )
+            }
         }
     }
 
     /** Lists every device usbmuxd currently knows about. */
     suspend fun listDevices(): List<UsbmuxProtocol.Device> = withContext(Dispatchers.IO) {
+        connect()
         val body = request(UsbmuxProtocol.listDevicesRequest())
         UsbmuxProtocol.parseDeviceList(body)
     }

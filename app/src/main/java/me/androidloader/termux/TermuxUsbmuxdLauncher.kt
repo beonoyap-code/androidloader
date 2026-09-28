@@ -66,6 +66,9 @@ object TermuxUsbmuxdLauncher {
         Intent().apply {
             setClassName(TERMUX_API_PACKAGE, "com.termux.api.RunCommandService")
             action = "com.termux.RUN_COMMAND"
+            // Required because this is launched from an application context
+            // rather than an activity, and it is a hard failure without it.
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/$TERMUX_PACKAGE/files/usr/bin/bash")
             // An ArrayList is required here; Termux:API reads this extra as an
             // ArrayList<String> and rejects a plain list.
@@ -73,8 +76,6 @@ object TermuxUsbmuxdLauncher {
             putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/$TERMUX_PACKAGE/files/usr")
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
             putExtra("com.termux.RUN_COMMAND_SESSION", session)
-            // Termux:API v0.50+ requires the caller to hold this permission, which
-            // is declared in the manifest and granted on install.
             putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", false)
         }
     } catch (e: Exception) {
@@ -82,26 +83,72 @@ object TermuxUsbmuxdLauncher {
     }
 
     /**
-     * Attempts to launch usbmuxd, returning null if Termux:API refused.
+     * The outcome of asking Termux:API to start the daemon.
      *
-     * The daemon is not reachable immediately afterwards; callers should poll
-     * [UsbmuxClient.connect] with a short delay.
+     * A sealed result rather than a boolean because each failure has a different
+     * remedy, and the user cannot see the Termux side of any of them.
+     */
+    sealed interface LaunchResult {
+        /** Termux:API accepted the request. The daemon is not up yet. */
+        data object Started : LaunchResult
+
+        /** Termux:API is not installed, or its service could not be resolved. */
+        data object NotInstalled : LaunchResult
+
+        /** Termux:API refused because this app lacks the RUN_COMMAND permission. */
+        data object PermissionDenied : LaunchResult
+
+        /** Anything else, with the reason to show. */
+        data class Failed(val reason: String) : LaunchResult
+    }
+
+    /**
+     * Asks Termux:API to run the daemon.
+     *
+     * [context] may be an application context, which is why the intent carries
+     * [android.content.Intent.FLAG_ACTIVITY_NEW_TASK]: `startActivity` from a
+     * non-activity context throws otherwise, and that failure is an
+     * `AndroidRuntimeException` rather than a `SecurityException`, so a narrower
+     * catch would let it crash the app.
+     *
+     * The daemon is not reachable when this returns; callers should poll
+     * [UsbmuxClient.connect] with a delay.
      */
     fun launch(
         context: android.content.Context,
         device: String? = null,
         endpoint: UsbmuxEndpoint = UsbmuxEndpoint.DEFAULT,
-    ): Boolean {
-        val intent = runCommandIntent(command(device, endpoint)) ?: return false
+    ): LaunchResult {
+        val intent = runCommandIntent(command(device, endpoint))
+            ?: return LaunchResult.NotInstalled
         return try {
             context.startActivity(intent)
-            true
+            LaunchResult.Started
         } catch (e: SecurityException) {
-            // Termux:API rejects callers that do not hold RUN_COMMAND permission.
-            false
+            LaunchResult.PermissionDenied
         } catch (e: android.content.ActivityNotFoundException) {
-            false
+            LaunchResult.NotInstalled
+        } catch (e: RuntimeException) {
+            // Includes the missing-NEW_TASK failure above, which must not take the
+            // app down with it.
+            LaunchResult.Failed(e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    /**
+     * Guidance for a failed launch, phrased for someone who cannot see Termux.
+     */
+    fun explain(result: LaunchResult): String = when (result) {
+        LaunchResult.Started -> ""
+        LaunchResult.NotInstalled ->
+            "Termux:API is not installed. Install Termux and Termux:API from F-Droid, " +
+                "then run in Termux:\n\npkg install usbmuxd libimobiledevice termux-api"
+        LaunchResult.PermissionDenied ->
+            "Termux:API refused the request. Open Settings, then Apps, Termux:API, " +
+                "Permissions, and allow \"Run commands\". The permission is " +
+                "${requiredPermission()}."
+        is LaunchResult.Failed ->
+            "Termux:API could not be started: ${result.reason}"
     }
 
     /** The `RUN_COMMAND` permission Termux:API checks. */
