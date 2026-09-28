@@ -26,6 +26,10 @@ data class SideloadUiState(
     val progressMessage: String = "",
     val error: String? = null,
     val hint: String? = null,
+    /** What the USB host API can see, as distinct from what usbmuxd reports. */
+    val usbNote: String? = null,
+    /** The iPhone's usbfs path, which is what termux-usb requires as an argument. */
+    val usbDevicePath: String? = null,
     val log: List<String> = emptyList(),
 ) {
     /** One line summarising where the flow has got to. */
@@ -38,15 +42,7 @@ data class SideloadUiState(
             else -> "Not connected to usbmuxd"
         }
 
-    /** The usbfs path of the iPhone, once discovery has found one. */
-    var usbDevicePath: String? = null
-        private set
-
-    /** Human-readable note about the USB bus, shown above the buttons. */
-    var usbNote: String? = null
-        private set
-
-    /**
+    /*
      * What to tell the user next.
      *
      * Deliberately leads with the manual route. usbmuxd may be started by
@@ -93,21 +89,16 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
             val context = getApplication<Application>()
             val found = UsbDiscovery.devices(context)
             val apple = found.firstOrNull { it.isApple }
-            _state.update {
-                it.copy(
-                    usbDevicePath = apple?.path,
-                    usbNote = when {
-                        found.isEmpty() ->
-                            "No USB device is visible. Plug the iPhone into the OTG port " +
-                                "and unlock it."
-                        apple == null ->
-                            "No iPhone found. This phone sees " +
-                                found.joinToString { it.description } + "."
-                        apple.hasPermission -> "iPhone at ${apple.path}, permission granted."
-                        else -> "iPhone at ${apple.path}. Permission will be requested."
-                    },
-                )
+            val note = when {
+                found.isEmpty() ->
+                    "No USB device is visible. Plug the iPhone into the OTG port and unlock it."
+                apple == null ->
+                    "No iPhone found. This phone sees " +
+                        found.joinToString { it.description } + "."
+                apple.hasPermission -> "iPhone at ${apple.path}, permission granted."
+                else -> "iPhone at ${apple.path}. Permission will be requested."
             }
+            _state.update { it.copy(usbNote = note, usbDevicePath = apple?.path) }
         }
     }
 
