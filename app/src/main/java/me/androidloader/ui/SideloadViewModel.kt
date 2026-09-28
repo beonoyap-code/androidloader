@@ -106,7 +106,7 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                 } else {
                     devices.forEach { append("found ${it.udid}") }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 fail(describe(e))
             }
         }
@@ -208,7 +208,7 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
                 } finally {
                     lockdown.close()
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 fail(describe(e))
             }
         }
@@ -218,7 +218,14 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
         _state.update { it.copy(error = null, hint = null) }
     }
 
-    private fun describe(e: Exception): String = when (e) {
+    /**
+     * Turns any failure into something worth reading.
+     *
+     * Catches [Throwable] rather than [Exception]: an [Error] escaping here would
+     * take the process down with no record of it, and the whole point of this app
+     * being testable remotely is that failures come back as text.
+     */
+    private fun describe(e: Throwable): String = when (e) {
         is me.androidloader.usbmux.UsbmuxUnavailableException ->
             e.message ?: "usbmuxd is not reachable"
         is me.androidloader.lockdown.LockdownException ->
@@ -226,7 +233,14 @@ class SideloadViewModel(application: Application) : AndroidViewModel(application
         is me.androidloader.afc.AfcException -> e.message ?: "the file transfer failed"
         is me.androidloader.install.InstallException -> e.message ?: "the install failed"
         is me.androidloader.usbmux.UsbmuxProtocolException -> e.message ?: "usbmuxd spoke unexpectedly"
-        else -> e.message ?: e.toString()
+        is kotlinx.coroutines.CancellationException -> throw e
+        else -> buildString {
+            append(e.message ?: e.javaClass.name)
+            // The first frame that is ours is usually the useful one; the Android
+            // internals above it are noise on a device.
+            e.stackTrace.firstOrNull { it.className.startsWith("me.androidloader") }
+                ?.let { append("\n\nat ").append(it) }
+        }
     }
 
     private fun fail(message: String) {

@@ -120,4 +120,7 @@ dependencies {
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.compose.ui.test.junit4)
+    // Supplies the ComponentActivity the Compose test rule needs.
+    debugImplementation(libs.compose.ui.test.manifest)
 }

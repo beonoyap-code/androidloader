@@ -3,6 +3,7 @@ package me.androidloader.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -11,8 +12,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -34,13 +33,19 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import me.androidloader.termux.TermuxUsbmuxdLauncher
 import me.androidloader.usbmux.UsbmuxProtocol
 
-class MainActivity : androidx.activity.ComponentActivity() {
-    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Installed before any of our own code runs, so a crash on the first
+        // frame is still recorded.
+        CrashLog.install(this)
+
+        val crash = CrashLog.consume(this)
+
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    SideloadScreen()
+                    SideloadScreen(lastCrash = crash)
                 }
             }
         }
@@ -55,7 +60,10 @@ class MainActivity : androidx.activity.ComponentActivity() {
  * since the app works against a daemon the user started themselves.
  */
 @Composable
-fun SideloadScreen(viewModel: SideloadViewModel = viewModel()) {
+fun SideloadScreen(
+    viewModel: SideloadViewModel = viewModel(),
+    lastCrash: String? = null,
+) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
 
@@ -77,6 +85,18 @@ fun SideloadScreen(viewModel: SideloadViewModel = viewModel()) {
         if (state.busy) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             Text(state.progressMessage, style = MaterialTheme.typography.bodySmall)
+        }
+
+        // A crash from the previous run is shown above everything else, because it
+        // is the only information available about a failure on a device with no
+        // debugger attached.
+        lastCrash?.let { trace ->
+            MessageCard(
+                title = "The app closed unexpectedly last time",
+                body = trace,
+                actionLabel = "Copy the details",
+                onAction = { copyToClipboard(context, trace) },
+            )
         }
 
         // The one thing to do next. Always enabled unless something is running,
@@ -210,16 +230,25 @@ private fun DeviceCard(
     }
 }
 
+/**
+ * The activity log.
+ *
+ * A plain Column, not a LazyColumn: this is already inside a Column with
+ * verticalScroll, and nesting a lazy scroller in the same direction throws at
+ * layout time. It only surfaced once the log became non-empty, which is to say
+ * on the first button press, so the app looked like it launched fine and then
+ * died on any interaction.
+ */
 @Composable
-private fun LogView(lines: List<String>) {
+internal fun LogView(lines: List<String>) {
     Card(modifier = Modifier.fillMaxWidth()) {
-        LazyColumn(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(8.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            items(lines) { line ->
+            for (line in lines) {
                 Text(
                     text = line,
                     style = MaterialTheme.typography.bodySmall,
