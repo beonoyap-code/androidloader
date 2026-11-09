@@ -8,39 +8,35 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Download APKTool
-        run: |
+        run: |-
           sudo apt-get update
           sudo apt-get install -y wget openjdk-17-jdk
           wget --quiet "https://github.com/iBotPeaches/Apktool/releases/download/v2.3.1/apktool.jar" -O apktool.jar
           chmod +x apktool.jar
           export PATH="$PATH:$(pwd)"
-
       - name: Download original APK from MediaFire
-        run: |
+        run: |-
           mkdir -p downloads
           curl -L -o downloads/LOWGMOD-8.2.104.apk "https://www.mediafire.com/file/6n4k9hmvjalsche/LOWGMOD-ANDROID-8.2.104.apk/file?dkey=d7lvli4phy1&r=916"
-
       - name: Decompile APK
-        run: java -jar apktool.jar d downloads/LOWGMOD-8.2.104.apk -o decompiled
-
+        run: |-
+          java -jar apktool.jar d downloads/LOWGMOD-8.2.104.apk -o decompiled
       - name: Replace key server URLs
-        run: |
+        run: |-
           find decompiled -name "*.smali" -exec sed -i "s|https://key.tsclowgmod.com|https://disabled-mod.example.com|g" {} \;
           sed -i "s|https://key.tsclowgmod.com|https://disabled-mod.example.com|g" decompiled/lib/arm64-v8a/liblowgmod.so
-
       - name: Rebuild APK
-        run: java -jar apktool.jar b decompiled -o downloads/patched-unsigned.apk
-
+        run: |-
+          java -jar apktool.jar b decompiled -o downloads/patched-unsigned.apk
       - name: Sign APK with debug keystore
-        run: |
+        run: |-
           keytool -genkeypair -keystore debug.keystore -alias androiddebugkey -storetype PKCS12 -validity 9999 -dname "cn=Android" -keyalg RSA -keysize 2048 -storepass android -keypass android > /dev/null 2>&1 || true
           apksigner sign --ks debug.keystore --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out downloads/patched-signed.apk downloads/patched-unsigned.apk
-
       - name: Zip-align APK
-        run: sudo apt-get install -y zipalign && zipalign -f -v 4 downloads/patched-signed.apk downloads/LOWGMOD-patched-final.apk
-
+        run: |-
+          sudo apt-get install -y zipalign
+          zipalign -f -v 4 downloads/patched-signed.apk downloads/LOWGMOD-patched-final.apk
       - name: Upload Patched APK
         uses: actions/upload-artifact@v4
         with:
